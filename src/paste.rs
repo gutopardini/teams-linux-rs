@@ -22,6 +22,7 @@ pub fn composer<'a>(
         shortcuts: None,
         rich_editor: false,
         shortcuts_suspended: false,
+        search_escape: None,
     })
 }
 pub fn rich_composer<'a>(
@@ -37,6 +38,7 @@ pub fn rich_composer<'a>(
         shortcuts: None,
         rich_editor: true,
         shortcuts_suspended: false,
+        search_escape: None,
     })
 }
 pub fn image<'a>(
@@ -52,6 +54,7 @@ pub fn image<'a>(
         shortcuts: None,
         rich_editor: false,
         shortcuts_suspended: false,
+        search_escape: None,
     })
 }
 struct Observed<'a, R: iced::advanced::text::Renderer = iced::Renderer> {
@@ -63,6 +66,7 @@ struct Observed<'a, R: iced::advanced::text::Renderer = iced::Renderer> {
     shortcuts: Option<(bool, bool, bool, bool, bool, bool)>,
     rich_editor: bool,
     shortcuts_suspended: bool,
+    search_escape: Option<AppMessage>,
 }
 pub fn shortcuts<'a>(
     inner: impl Into<Element<'a, AppMessage>>,
@@ -73,6 +77,7 @@ pub fn shortcuts<'a>(
     image_viewer_open: bool,
     new_conversation_open: bool,
     message_search_open: bool,
+    search_escape: Option<AppMessage>,
 ) -> Element<'a, AppMessage> {
     Element::new(Observed {
         inner: inner.into(),
@@ -90,6 +95,7 @@ pub fn shortcuts<'a>(
         )),
         rich_editor: false,
         shortcuts_suspended,
+        search_escape,
     })
 }
 
@@ -467,6 +473,15 @@ impl<R: iced::advanced::text::Renderer> Widget<AppMessage, Theme, R> for Observe
         ) = event
         {
             state.modifiers = *modifiers;
+        }
+        if let Some(dismiss) = self.search_escape.as_ref().filter(|_| !self.shortcuts_suspended)
+            && matches!(event, Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape), ..
+            }))
+        {
+            shell.publish(dismiss.clone());
+            shell.capture_event();
+            return;
         }
         if let Some((
             settings_open,
@@ -871,6 +886,7 @@ mod tests {
         let mut widget = Observed {
             inner: input, context: "chat:test".into(), text: None, image_url: None,
             value: text.into(), shortcuts: None, rich_editor: false, shortcuts_suspended: false,
+            search_escape: None,
         };
         let mut tree = Tree::new(&widget as &dyn Widget<AppMessage, Theme, ()>);
         let node = widget.layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, Size::new(600.0, 60.0)));
@@ -1402,6 +1418,7 @@ mod tests {
             shortcuts: None,
             rich_editor: false,
         shortcuts_suspended: false,
+        search_escape: None,
         };
         let mut tree = Tree::new(&widget as &dyn Widget<AppMessage, Theme, ()>);
         let node = widget.layout(
@@ -1452,6 +1469,7 @@ mod tests {
             shortcuts: None,
             rich_editor: false,
         shortcuts_suspended: false,
+        search_escape: None,
         };
         let mut tree = Tree::new(&widget as &dyn Widget<AppMessage, Theme, ()>);
         let node = widget.layout(

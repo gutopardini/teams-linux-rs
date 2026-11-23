@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessage> {
     performance::chat_list_built();
     let search_button = hint(
-        button(icon_tone(Icon::Search, Tone::Secondary, 18.0))
+        button(icon_tone(Icon::Search, if state.chat_list_search.is_some() { Tone::Accent } else { Tone::Secondary }, 18.0))
             .padding(9)
-            .on_press(AppMessage::FocusSearch)
+            .on_press(AppMessage::ToggleChatListSearch)
             .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Text, 6.0)),
-        tr("Go to a chat or channel (Ctrl+Alt+E)"),
+        tr("Filter by person or chat name"),
     );
     let header = row![
         text("Chat")
@@ -59,6 +59,7 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
     .align_y(Alignment::Center)
     .wrap();
 
+    let query = sidebar_query(state);
     let mut conversations = column![].spacing(CHAT_ROW_GAP);
     if matches!(
         state.chat_list_filter,
@@ -165,7 +166,7 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
         let visible_chats: HashSet<&str> = state
             .chats
             .iter()
-            .filter(|chat| chat.hidden != Some(true))
+            .filter(|chat| chat.hidden != Some(true) && title_matches_query(&chat.title, &query))
             .map(|chat| chat.id.as_str())
             .collect();
         for (id, messages) in state
@@ -230,7 +231,7 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
         }
     } else if !grouped || !state.chat_organization.chats_collapsed {
         for chat in &state.chats {
-            if !listed_chat(state, chat, "", grouped) {
+            if !listed_chat(state, chat, &query, grouped) {
                 continue;
             }
             visible_count += 1;
@@ -239,6 +240,7 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
     }
     if visible_count == 0 && (!grouped || !state.chat_organization.chats_collapsed) {
         let status = match state.chat_list_filter {
+            _ if !query.is_empty() => tr("No conversations found."),
             ChatListFilter::Drafts => tr("No chat drafts."),
             ChatListFilter::Mentions => tr("No mentions in loaded messages."),
             ChatListFilter::Hidden => tr("No hidden conversations."),
@@ -255,12 +257,19 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
     } else {
         container(header).padding([20, 40])
     };
-    let mut top = column![
-        header,
-        crate::divider(),
-        container(filters).padding([12, 40])
-    ]
-    .spacing(0);
+    let mut top = column![header, crate::divider()].spacing(0);
+    if let Some(query) = &state.chat_list_search {
+        top = top.push(container(
+            text_input(tr("Filter by person or chat name"), query)
+                .id("chat-list-search")
+                .on_input(AppMessage::ChatListSearchChanged)
+                .size(16)
+                .padding([8, 12])
+                .style(ui_input(false))
+                .width(Fill),
+        ).padding(iced::Padding { top: 12.0, right: 20.0, left: 40.0, bottom: 0.0 }));
+    }
+    top = top.push(container(filters).padding([12, 40]));
     if state.sidebar_menu_open {
         top = top.push(
             button(text(tr("Hidden chats")).size(13))
@@ -512,13 +521,17 @@ pub(crate) fn typing_dots(phase: u8, accent: bool) -> Element<'static, AppMessag
 }
 
 pub fn grouped(state: &TeamsApp) -> bool {
-    matches!(
+    state.chat_list_search.as_deref().is_none_or(|query| query.trim().is_empty()) && matches!(
         state.chat_list_filter,
         ChatListFilter::Recent
             | ChatListFilter::Chats
             | ChatListFilter::Meetings
             | ChatListFilter::Unread
     )
+}
+
+fn sidebar_query(state: &TeamsApp) -> String {
+    state.chat_list_search.as_deref().unwrap_or_default().trim().to_lowercase()
 }
 pub fn has_draft(state: &TeamsApp, id: &str) -> bool {
     let key = format!("chat:{id}");
@@ -622,7 +635,7 @@ fn listed_chat(state: &TeamsApp, chat: &ChatSummary, query: &str, grouped: bool)
 }
 
 /// `query` is already lowercased, matching the previous `to_lowercase` filter.
-fn title_matches_query(title: &str, query: &str) -> bool {
+pub(crate) fn title_matches_query(title: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -651,6 +664,7 @@ fn divider() -> Element<'static, AppMessage> {
 /// Estimate only sidebar row visibility, with a full row of overscan. Section
 /// chrome is part of the scroll content, so it must not shift avatar requests.
 pub fn avatar_window(state: &TeamsApp) -> Vec<&ChatSummary> {
+    let query = sidebar_query(state);
     let grouped = grouped(state);
     let indexed_chats = (grouped && !state.chat_organization.favorites_collapsed).then(|| chats_by_id(state));
     let mut y = if grouped {
@@ -688,7 +702,7 @@ pub fn avatar_window(state: &TeamsApp) -> Vec<&ChatSummary> {
         && (!grouped || !state.chat_organization.chats_collapsed)
     {
         for chat in &state.chats {
-            if !listed_chat(state, chat, "", grouped) {
+            if !listed_chat(state, chat, &query, grouped) {
                 continue;
             }
             rows.push((y, chat));

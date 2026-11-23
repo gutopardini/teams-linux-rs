@@ -823,6 +823,10 @@ enum AppMessage {
     CancelLeaveGroup,
     GroupLeaveFinished(u64, String, Result<(), String>),
     FocusSearch,
+    DismissGlobalSearch,
+    ToggleChatListSearch,
+    ChatListSearchChanged(String),
+    CloseChatListSearch,
     ShowConversationChat,
     ShowSharedFiles,
     ShowMeetingRecap,
@@ -1537,6 +1541,26 @@ fn merge_global_message_results(
             current.push(hit);
         }
     }
+}
+
+fn local_search_people(state: &TeamsApp, query: &str) -> Vec<PersonSearchResult> {
+    let query = query.to_lowercase();
+    let owner = avatars::person_id(&state.user_id);
+    let mut seen = HashSet::new();
+    state.chats.iter()
+        .filter(|chat| !chat.is_group && chat.hidden != Some(true)
+            && chat_sidebar_ui::title_matches_query(&chat.title, &query))
+        .filter_map(|chat| {
+            let id = state.chat_person_id(chat)?;
+            (Some(&id) != owner.as_ref() && seen.insert(id.clone())).then(|| PersonSearchResult {
+                id,
+                display_name: chat.title.clone(),
+                email: String::new(),
+                job_title: None,
+            })
+        })
+        .take(20)
+        .collect()
 }
 
 fn message_search_match_indices(messages: &[GraphMessage], query: &str) -> Vec<usize> {
@@ -2262,6 +2286,7 @@ struct TeamsApp {
     company_name: String,
     chats: Vec<ChatSummary>,
     chat_list_filter: ChatListFilter,
+    chat_list_search: Option<String>,
     chat_organization: chat_sidebar::Organization,
     chat_organization_store: Option<chat_sidebar::Store>,
     chat_organization_loaded: bool,
@@ -2328,6 +2353,7 @@ struct TeamsApp {
     global_people_sequence: u64,
     global_message_results: Vec<graph::MessageSearchResult>,
     global_message_error: Option<String>,
+    global_message_search_restricted: bool,
     global_message_loading: bool,
     global_message_search_cancel: Option<tokio::sync::oneshot::Sender<()>>,
     global_message_next_from: Option<usize>,
@@ -5393,6 +5419,7 @@ impl TeamsApp {
             company_name: String::new(),
             chats: Vec::new(),
             chat_list_filter: ChatListFilter::Recent,
+            chat_list_search: None,
             chat_organization: Default::default(),
             chat_organization_store: None,
             chat_organization_loaded: false,
@@ -5459,6 +5486,7 @@ impl TeamsApp {
             global_people_sequence: 0,
             global_message_results: Vec::new(),
             global_message_error: None,
+            global_message_search_restricted: false,
             global_message_loading: false,
             global_message_search_cancel: None,
             global_message_next_from: None,
@@ -5713,6 +5741,15 @@ impl TeamsApp {
                 job_title: Some("Suporte".into()),
             }];
             self.global_message_next_from = Some(2);
+        }
+
+        if std::env::args().any(|arg| arg == "--chat-list-search-demo") {
+            self.chat_list_search = Some("Ana".into());
+        }
+        if std::env::args().any(|arg| arg == "--restricted-search-demo") {
+            self.search = "Ana".into();
+            self.global_people_results = local_search_people(self, "Ana");
+            self.global_message_error = Some(tr("Message search is unavailable for this account.").into());
         }
 
         if std::env::args().any(|arg| arg == "--inline-image-demo" || arg == "--viewer-image-demo") {
@@ -12952,6 +12989,34 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             Task::none()
         }
         AppMessage::FocusSearch => iced::widget::operation::focus("conversation-search"),
+        AppMessage::DismissGlobalSearch => {
+            let clear = update_inner(state, AppMessage::SearchChanged(String::new()));
+            Task::batch([clear, iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())])
+        }
+        AppMessage::ToggleChatListSearch => {
+            if state.chat_list_search.is_some() {
+                return update_inner(state, AppMessage::CloseChatListSearch);
+            }
+            let dismiss = update_inner(state, AppMessage::DismissGlobalSearch);
+            state.chat_list_search = Some(String::new());
+            dismiss.chain(iced::widget::operation::focus("chat-list-search"))
+        }
+        AppMessage::ChatListSearchChanged(query) => {
+            if let Some(search) = &mut state.chat_list_search {
+                *search = query;
+                state.chat_list_offset = 0.0;
+                return iced::widget::operation::snap_to("chat-list", scrollable::RelativeOffset::START);
+            }
+            Task::none()
+        }
+        AppMessage::CloseChatListSearch => {
+            state.chat_list_search = None;
+            state.chat_list_offset = 0.0;
+            Task::batch([
+                iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus()),
+                iced::widget::operation::snap_to("chat-list", scrollable::RelativeOffset::START),
+            ])
+        }
         AppMessage::ShowConversationChat => {
             state.conversation_surface = ConversationSurface::Chat;
             Task::none()
@@ -15598,16 +15663,16 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             {
                 state.pending_global_message_jump = None;
             }
-            state.chat_list_offset = 0.0;
             state.global_people_sequence = state.global_people_sequence.wrapping_add(1);
             state.global_people_results.clear();
             state.global_people_error = None;
             state.global_message_results.clear();
             state.global_message_error = None;
             state.global_message_next_from = None;
-            let snap =
-                iced::widget::operation::snap_to("chat-list", scrollable::RelativeOffset::START);
             let query = search.trim().to_owned();
+            if global_search_query_ready(&query, false) {
+                state.global_people_results = local_search_people(state, &query);
+            }
             if !global_search_query_ready(&query, state.demo_mode) {
                 state.global_people_loading = false;
                 state.global_message_loading = false;
@@ -15615,15 +15680,15 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     state.global_message_error =
                         Some(tr("Search queries can contain up to 256 characters.").into());
                 }
-                return snap;
+                return Task::none();
             }
             let Some(session) = state.session.clone() else {
                 state.global_people_loading = false;
                 state.global_message_loading = false;
-                return snap;
+                return Task::none();
             };
             state.global_people_loading = true;
-            state.global_message_loading = true;
+            state.global_message_loading = !state.global_message_search_restricted;
             let sequence = state.global_people_sequence;
             let epoch = state.session_epoch;
             let (people_cancel, people_cancellation) = tokio::sync::oneshot::channel();
@@ -15635,6 +15700,10 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 query.clone(),
                 people_cancellation,
             );
+            if state.global_message_search_restricted {
+                state.global_message_error = Some(tr("Message search is unavailable for this account.").into());
+                return people;
+            }
             let messages = global_message_search_task(
                 session,
                 epoch,
@@ -15648,7 +15717,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     cancellation
                 },
             );
-            Task::batch([snap, people, messages])
+            Task::batch([people, messages])
         }
         AppMessage::GlobalPeopleSearchLoaded(epoch, sequence, query, result) => {
             if !global_people_result_is_current(
@@ -15671,6 +15740,9 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                             avatars::person_id(&person.id).as_deref() != Some(owner.as_str())
                         });
                     }
+                    let mut seen = people.iter().map(|person| person.id.clone()).collect::<HashSet<_>>();
+                    people.extend(local_search_people(state, &query).into_iter()
+                        .filter(|person| seen.insert(person.id.clone())));
                     state.global_people_results = people;
                     state.global_people_error = None;
                 }
@@ -15701,7 +15773,15 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     state.global_message_next_from = page.next_from;
                     state.global_message_error = None;
                 }
-                Err(error) => state.global_message_error = Some(error),
+                Err(error) => {
+                    state.global_message_search_restricted = error.contains("HTTP 403");
+                    state.global_message_next_from = None;
+                    state.global_message_error = Some(tr(if state.global_message_search_restricted {
+                        "Message search is unavailable for this account."
+                    } else {
+                        "Could not search messages."
+                    }).into());
+                }
             }
             Task::none()
         }
@@ -16788,6 +16868,9 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::AuthenticationComplete(Ok(session)) => {
             state.stop_trouter();
             cancel_global_search_requests(state);
+            state.search.clear();
+            state.chat_list_search = None;
+            state.global_message_search_restricted = false;
             if let Some(upload) = state.document_upload.take() {
                 let _ = upload.cancel.send(true);
             }
@@ -18152,7 +18235,9 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             }
             state.stop_trouter();
             state.cancel_audio_test();
-            cancel_global_search_requests(state);
+            drop(update_inner(state, AppMessage::SearchChanged(String::new())));
+            state.chat_list_search = None;
+            state.global_message_search_restricted = false;
             state.reply_target = None;
             state.channel_reply_target = None;
             state.collapsed_channel_threads.clear();
@@ -18592,6 +18677,14 @@ fn highlighted_line<'a>(value: &str, query: &str, size: f32) -> Element<'a, AppM
     line.into()
 }
 
+fn global_search_visible(state: &TeamsApp) -> bool {
+    state.search.trim().chars().take(2).count() == 2
+        && !state.profile_menu_open && state.app_menu.surface.is_none()
+        && state.person_card.is_none() && !state.group_details_open
+        && !state.new_conversation_open && state.image_viewer.is_none()
+        && !state.status_note_open
+}
+
 fn global_search_dropdown(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMessage> {
     let query = state.search.trim();
     let mut results = column![].spacing(2).width(Fill);
@@ -18687,6 +18780,8 @@ fn global_search_dropdown(state: &TeamsApp, size: iced::Size) -> Element<'_, App
             .padding([8, 12]),
         );
     }
+    let messages = results;
+    let mut results = column![].spacing(2).width(Fill);
     results = results.push(
         container(
             text(tr("People"))
@@ -18699,8 +18794,8 @@ fn global_search_dropdown(state: &TeamsApp, size: iced::Size) -> Element<'_, App
     if state.global_people_results.is_empty() {
         let status = if state.global_people_loading {
             tr("Searching for people…")
-        } else if let Some(error) = state.global_people_error.as_deref() {
-            error
+        } else if state.global_people_error.is_some() {
+            tr("Could not search the people directory.")
         } else if state.demo_mode {
             tr("The demo uses sample people.")
         } else {
@@ -18734,14 +18829,7 @@ fn global_search_dropdown(state: &TeamsApp, size: iced::Size) -> Element<'_, App
         .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Text, 6.0));
         results = results.push(row);
     }
-    results = results.push(
-        container(
-            text(tr("Press Enter to see more messages"))
-                .size(12)
-                .style(ui_text(Tone::Muted)),
-        )
-        .padding([8, 12]),
-    );
+    results = results.push(messages);
     let layout = window_chrome::BarLayout::new(size.width);
     let width = layout.search_width.max(420.0).min((size.width - 24.0).max(1.0));
     let left = layout.search_left.min((size.width - width - 12.0).max(12.0));
@@ -18757,7 +18845,7 @@ fn global_search_dropdown(state: &TeamsApp, size: iced::Size) -> Element<'_, App
             };
             style
         });
-    container(opaque(panel))
+    let positioned = container(opaque(panel))
         .width(Fill)
         .height(Fill)
         .align_left(Fill)
@@ -18766,8 +18854,18 @@ fn global_search_dropdown(state: &TeamsApp, size: iced::Size) -> Element<'_, App
             top: appearance::metrics::TOP_BAR + 6.0,
             left,
             ..Default::default()
-        })
-        .into()
+        });
+    let dismiss = |width| mouse_area(container(space::vertical()).width(width).height(Fill))
+        .on_press(AppMessage::DismissGlobalSearch);
+    let outside = column![
+        row![
+            dismiss(iced::Length::Fixed(layout.search_left)),
+            space::horizontal().width(layout.search_width),
+            dismiss(Fill),
+        ].height(appearance::metrics::TOP_BAR),
+        dismiss(Fill),
+    ].width(Fill).height(Fill);
+    stack![outside, positioned].width(Fill).height(Fill).into()
 }
 
 fn profile_menu_view(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMessage> {
@@ -20077,11 +20175,7 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
             };
             let base = if state.app_menu.surface.is_some() { modal_gate::inert(base) } else { modal_gate::view(base,false) };
             let content = conversation_overlay(base, overlay);
-            let content = if state.search.trim().chars().count() >= 2
-                && !state.profile_menu_open
-                && state.app_menu.surface.is_none()
-                && state.person_card.is_none()
-            {
+            let content = if global_search_visible(state) {
                 stack![content, global_search_dropdown(state, size)]
                     .width(Fill)
                     .height(Fill)
@@ -20132,6 +20226,15 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
             || state.status_note_open
             || state.app_menu.surface.is_some(),
         state.message_search_open,
+        if global_search_visible(state) {
+            Some(AppMessage::DismissGlobalSearch)
+        } else if state.section == Section::Chats && !state.settings_open && state.chat_list_search.is_some()
+            && state.message_menu_for.is_none() && !state.message_search_open
+        {
+            Some(AppMessage::CloseChatListSearch)
+        } else {
+            None
+        },
     ))
 }
 
@@ -23539,6 +23642,82 @@ mod tests {
         assert!(global_search_query_ready(" rob ", false));
         assert!(!global_search_query_ready("rob", true));
         assert!(!global_search_query_ready(&"x".repeat(257), false));
+    }
+
+    #[test]
+    fn sidebar_filter_stays_local_and_restores_the_chat_list_on_close() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.chat_list_height = 1000.0;
+        state.search = "global query".into();
+        drop(update_inner(&mut state, AppMessage::ToggleChatListSearch));
+        drop(update_inner(&mut state, AppMessage::ChatListSearchChanged("PAULA".into())));
+        assert!(state.search.is_empty());
+        assert!(state.global_people_search_cancel.is_none());
+        assert!(state.global_message_search_cancel.is_none());
+        assert_eq!(chat_sidebar_ui::avatar_window(&state).iter().map(|chat| chat.title.as_str()).collect::<Vec<_>>(), ["Ana Paula"]);
+        drop(update_inner(&mut state, AppMessage::CloseChatListSearch));
+        assert!(state.chat_list_search.is_none());
+        assert!(chat_sidebar_ui::avatar_window(&state).len() > 1);
+    }
+
+    #[test]
+    fn denied_message_search_keeps_people_and_dismissal_cancels_requests() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        drop(update_inner(&mut state, AppMessage::SearchChanged("Paula".into())));
+        let epoch = state.session_epoch;
+        let sequence = state.global_people_sequence;
+        let (cancel, mut cancellation) = tokio::sync::oneshot::channel();
+        state.global_people_search_cancel = Some(cancel);
+        drop(update_inner(&mut state, AppMessage::GlobalMessageSearchLoaded(
+            epoch, sequence, "Paula".into(), 0, Err("Teams: HTTP 403 for https://example.test: raw fixture".into()),
+        )));
+        assert_eq!(state.global_people_results[0].display_name, "Ana Paula");
+        assert!(state.global_message_search_restricted);
+        assert_eq!(state.global_message_error.as_deref(), Some("Message search is unavailable for this account."));
+        drop(update_inner(&mut state, AppMessage::DismissGlobalSearch));
+        assert!(cancellation.try_recv().is_ok());
+        drop(update_inner(&mut state, AppMessage::GlobalPeopleSearchLoaded(
+            epoch, sequence, "Paula".into(), Err("stale".into()),
+        )));
+        assert!(!global_search_visible(&state));
+        assert!(state.global_people_error.is_none() && state.global_people_results.is_empty());
+    }
+
+    #[test]
+    fn search_dropdown_captures_outside_clicks_and_escape() {
+        use iced::advanced::{Layout, Shell, layout, mouse, widget::Tree};
+        use iced::keyboard::{Event as KeyEvent, Key, Location, Modifiers, key::{Code, Named, Physical}};
+        let renderer = chat_render_tests::headless_renderer();
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        drop(update_inner(&mut state, AppMessage::SearchChanged("Ana".into())));
+        let size = iced::Size::new(1440.0, 900.0);
+        let limits = layout::Limits::new(iced::Size::ZERO, size);
+        let viewport = iced::Rectangle::with_size(size);
+        let bar = window_chrome::BarLayout::new(size.width);
+        let press = iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let escape = iced::Event::Keyboard(KeyEvent::KeyPressed {
+            key: Key::Named(Named::Escape), modified_key: Key::Named(Named::Escape),
+            physical_key: Physical::Code(Code::Escape), location: Location::Standard,
+            modifiers: Modifiers::empty(), text: None, repeat: false,
+        });
+        for (event, position, should_close) in [
+            (&press, iced::Point::new(bar.search_left + 40.0, 25.0), false),
+            (&press, iced::Point::new(bar.search_left + 40.0, 80.0), false),
+            (&press, iced::Point::new(1250.0, 600.0), true),
+            (&escape, iced::Point::new(bar.search_left + 40.0, 25.0), true),
+        ] {
+            let mut view = view_impl(&state);
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let mut messages = Vec::new();
+            view.as_widget_mut().update(
+                &mut tree, event, Layout::new(&node), mouse::Cursor::Available(position),
+                &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport,
+            );
+            assert_eq!(messages.iter().any(|message| matches!(message, AppMessage::DismissGlobalSearch)),
+                should_close, "{event:?} at {position:?}");
+        }
     }
 
     #[test]
