@@ -4849,8 +4849,8 @@ pub fn view_with_media(
     let mut emoji_preferences;
     let prefs = if standalone_emoji {
         emoji_preferences = prefs.clone();
-        emoji_preferences.message_size = (u32::from(prefs.message_size) * 3 / 4)
-            .clamp(12, u32::from(prefs.message_size)) as u16;
+        emoji_preferences.message_size = (u32::from(prefs.message_size) * 3 / 2)
+            .clamp(24, 48) as u16;
         &emoji_preferences
     } else {
         prefs

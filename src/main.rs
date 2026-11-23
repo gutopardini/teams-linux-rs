@@ -8926,21 +8926,24 @@ impl TeamsApp {
         } else {
             None
         };
-        let composer: Element<'_, AppMessage> = if let Some(banner) = typing_banner {
-            column![
-                container(banner)
-                    .padding(iced::Padding { left: 30.0, bottom: 4.0, ..Default::default() })
-                    .width(Fill)
-                    .max_width(appearance::metrics::COMPOSER_WIDTH),
-                composer,
-            ]
-            .spacing(0)
-            .width(Fill)
-            .max_width(appearance::metrics::COMPOSER_WIDTH)
-            .into()
-        } else {
-            composer
-        };
+        let has_typing_banner = typing_banner.is_some();
+        let typing_slot: Element<'_, AppMessage> =
+            typing_banner.unwrap_or_else(|| row![].into());
+        let composer: Element<'_, AppMessage> = column![
+            container(typing_slot)
+                .padding(if has_typing_banner {
+                    iced::Padding { left: 30.0, bottom: 4.0, ..Default::default() }
+                } else {
+                    iced::Padding::default()
+                })
+                .width(Fill)
+                .max_width(appearance::metrics::COMPOSER_WIDTH),
+            composer,
+        ]
+        .spacing(0)
+        .width(Fill)
+        .max_width(appearance::metrics::COMPOSER_WIDTH)
+        .into();
 
         let composer:Element<'_,AppMessage>=if quote_compose&&self.editing_message_id.is_none() {
             column![composer,container(text(tr("Shift+Enter starts a new line.")).size(12).style(ui_text(Tone::Muted))).align_right(Fill)].spacing(5).width(Fill).max_width(appearance::metrics::COMPOSER_WIDTH).into()
