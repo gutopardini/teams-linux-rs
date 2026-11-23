@@ -358,6 +358,8 @@ enum ConversationSurface {
 struct IncomingCallNotice {
     id: String,
     caller_name: String,
+    is_video: bool,
+    alert_visible: bool,
 }
 
 #[derive(Clone)]
@@ -9701,6 +9703,82 @@ impl TeamsApp {
             .style(ui_surface(Tone::Canvas, false, 0.0))
             .into()
     }
+
+    fn incoming_call_banners_view(&self, size: iced::Size) -> Element<'_, AppMessage> {
+        let mut banners = column![].spacing(8).width(Fill);
+        let mut visible = false;
+        for notice in self.incoming_call_notices.iter().rev().filter(|notice| notice.alert_visible).take(3) {
+            visible = true;
+            let title = if notice.is_video { tr("Incoming video call") } else { tr("Incoming audio call") };
+            let icon = if notice.is_video { Icon::Camera } else { Icon::Calls };
+            let caller = preview_line(&notice.caller_name, 64);
+            let action = AppMessage::DesktopIncomingCallAction(self.session_epoch, notice.id.clone());
+            let card = container(
+                column![
+                    row![
+                        container(icon_tone(icon, Tone::Accent, 19.0))
+                            .width(38)
+                            .height(38)
+                            .center(Fill)
+                            .style(ui_surface(Tone::Accent, true, 8.0)),
+                        column![
+                            text(title).size(13).font(semibold()).style(ui_text(Tone::Secondary)),
+                            text(caller).size(16).font(semibold()).style(ui_text(Tone::Text)),
+                        ]
+                        .spacing(3)
+                        .width(Fill),
+                        hint(
+                            button(text("×").size(19))
+                                .padding([4, 8])
+                                .on_press(AppMessage::DismissIncomingCall(notice.id.clone()))
+                                .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Secondary, 6.0)),
+                            tr("Dismiss notification"),
+                        ),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    row![
+                        space::horizontal(),
+                        button(text(tr("View call")).size(13).font(semibold()))
+                            .padding([7, 12])
+                            .on_press(action)
+                            .style(ui_button(Tone::Primary, Tone::SelectedHover, Tone::OnPrimary, 6.0)),
+                    ]
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(12),
+            )
+            .width(Fill)
+            .padding(12)
+            .style(|theme| {
+                let mut style = ui_surface(Tone::Surface, true, 10.0)(theme);
+                style.shadow = iced::Shadow {
+                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.30),
+                    offset: iced::Vector::new(0.0, 5.0),
+                    blur_radius: 18.0,
+                };
+                style
+            });
+            banners = banners.push(card);
+        }
+        if !visible {
+            return space::vertical().into();
+        }
+        let panel = container(banners)
+            .width((size.width - 24.0).clamp(280.0, 390.0))
+            .max_height((size.height - appearance::metrics::TOP_BAR - 24.0).max(120.0));
+        container(panel)
+            .width(Fill)
+            .height(Fill)
+            .align_right(Fill)
+            .align_top(Fill)
+            .padding(iced::Padding {
+                top: appearance::metrics::TOP_BAR + 10.0,
+                right: 16.0,
+                ..Default::default()
+            })
+            .into()
+    }
 }
 
 fn load_teams_task(session: TeamsSession) -> Task<AppMessage> {
@@ -10762,7 +10840,10 @@ fn remember_incoming_call_id(state: &mut TeamsApp, id: &str) -> bool {
 
 fn incoming_call_notice(payload_json: &str) -> Option<IncomingCallNotice> {
     let notification = ost::calling::parse_call_notification(payload_json)?;
-    notification.call_invitation.as_ref()?;
+    let invitation = notification.call_invitation.as_ref()?;
+    let is_video = invitation.call_modalities.as_ref().is_some_and(|modalities| {
+        modalities.iter().any(|modality| modality.eq_ignore_ascii_case("video"))
+    });
     let caller_name = notification
         .participants
         .as_ref()
@@ -10791,7 +10872,7 @@ fn incoming_call_notice(payload_json: &str) -> Option<IncomingCallNotice> {
                 .collect::<String>()
         )
     });
-    Some(IncomingCallNotice { id, caller_name })
+    Some(IncomingCallNotice { id, caller_name, is_video, alert_visible: true })
 }
 
 fn scroll_to_latest() -> Task<AppMessage> {
@@ -13719,6 +13800,9 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::DesktopIncomingCallAction(epoch,id)=>{
             if epoch==state.session_epoch && state.session.is_some() && state.incoming_call_notices.iter().any(|n|n.id==id) {
                 state.desktop_call_notices.close_chat(&id);
+                if let Some(notice) = state.incoming_call_notices.iter_mut().find(|notice| notice.id == id) {
+                    notice.alert_visible = false;
+                }
                 if state.native_call.is_none() && state.prejoin.is_none() {
                     state.settings_open=false;
                     state.app_menu.apply(app_menu::Action::Close);
@@ -20482,8 +20566,16 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
             let content = if state.app_menu.surface.is_some() {
                 stack![content, app_menu::view(state,size)].width(Fill).height(Fill).into()
             } else {content};
-            if state.status_note_open {
+            let content = if state.status_note_open {
                 stack![content, status_note_view(state, size)]
+                    .width(Fill)
+                    .height(Fill)
+                    .into()
+            } else {
+                content
+            };
+            if state.incoming_call_notices.iter().any(|notice| notice.alert_visible) {
+                stack![content, state.incoming_call_banners_view(size)]
                     .width(Fill)
                     .height(Fill)
                     .into()
@@ -20629,7 +20721,7 @@ mod tests {
     fn desktop_call_click_opens_received_calls_only_for_current_session_and_preserves_chat() {
         let mut state=TeamsApp::from_client_id(String::new());state.load_demo_data();
         state.session=Some(TeamsSession::test_fixture());state.section=Section::Chats;
-        state.incoming_call_notices.push_back(IncomingCallNotice{id:"fixture".into(),caller_name:"Ana".into()});
+        state.incoming_call_notices.push_back(IncomingCallNotice{id:"fixture".into(),caller_name:"Ana".into(),is_video:false,alert_visible:true});
         let selected=state.selected_chat.clone();state.draft="Rascunho".into();state.settings_open=true;
         let stale_epoch=state.session_epoch+1;
         let _=update_inner(&mut state,AppMessage::DesktopIncomingCallAction(stale_epoch,"fixture".into()));
@@ -21904,6 +21996,8 @@ mod tests {
         state.incoming_call_notices.push_back(IncomingCallNotice {
             id: "call-1".into(),
             caller_name: "Ana Silva".into(),
+            is_video: false,
+            alert_visible: true,
         });
         state.stop_trouter();
         assert!(state.incoming_call_notices.is_empty());
