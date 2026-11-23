@@ -315,10 +315,26 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
 fn chat_row(state: &TeamsApp, chat: &ChatSummary) -> Element<'static, AppMessage> {
     let selected = state.selected_chat.as_deref() == Some(chat.id.as_str());
     let draft_preview = draft_preview(state, &chat.id);
+    let loaded_preview = (state.chat_messages_loaded_for.as_deref() == Some(chat.id.as_str())
+        && matches!(chat.preview.as_str(), "Mensagem" | "Você: Mensagem"))
+        .then(|| state.messages.last())
+        .flatten()
+        .and_then(|message| {
+            let body = if message.body.trim().is_empty() {
+                message.rich.as_deref().map(message_body::Document::clipboard_payload)
+                    .map(|payload| payload.text)
+                    .unwrap_or_default()
+            } else {
+                message.body.clone()
+            };
+            (!body.trim().is_empty()).then(|| {
+                graph::conversation_preview(chat.is_group, Some(&message.author), &body, &state.user_name)
+            })
+        });
     let preview = if state.chat_list_filter == ChatListFilter::Drafts {
         draft_preview.as_deref().unwrap_or(&chat.preview)
     } else {
-        chat.preview.as_str()
+        loaded_preview.as_deref().unwrap_or(&chat.preview)
     };
     let unread = chat.unread == Some(true);
     let activity = chat_time::label(
@@ -497,13 +513,13 @@ fn chat_preview_line(preview: &str, group: bool, unread: bool) -> Element<'stati
 
 pub(crate) fn typing_dots(phase: u8, accent: bool) -> Element<'static, AppMessage> {
     let active = usize::from(phase) % 4;
-    let mut dots = row![].spacing(4).align_y(Alignment::Center);
+    let mut dots = row![].spacing(5).align_y(Alignment::Center);
     for index in 0..3 {
         let on = active == index;
         dots = dots.push(
             container(space::horizontal())
-                .width(6)
-                .height(6)
+                .width(8)
+                .height(8)
                 .style(ui_surface(
                     if on && accent {
                         Tone::Accent
@@ -517,7 +533,7 @@ pub(crate) fn typing_dots(phase: u8, accent: bool) -> Element<'static, AppMessag
                 )),
         );
     }
-    container(dots).height(16).align_y(Alignment::Center).into()
+    container(dots).height(18).align_y(Alignment::Center).into()
 }
 
 pub fn grouped(state: &TeamsApp) -> bool {

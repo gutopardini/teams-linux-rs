@@ -4836,6 +4836,25 @@ pub fn view_with_media(
         plain = Document::plain(fallback);
         &plain
     };
+    let visible_text = document.blocks.iter()
+        .flat_map(|block| text_runs(block))
+        .map(|run| run.text.as_str())
+        .collect::<String>();
+    let standalone_emoji = {
+        use unicode_segmentation::UnicodeSegmentation;
+        let trimmed = visible_text.trim();
+        let mut graphemes = trimmed.graphemes(true);
+        graphemes.next().is_some_and(typography::is_color_emoji) && graphemes.next().is_none()
+    };
+    let mut emoji_preferences;
+    let prefs = if standalone_emoji {
+        emoji_preferences = prefs.clone();
+        emoji_preferences.message_size = (u32::from(prefs.message_size) * 3 / 4)
+            .clamp(12, u32::from(prefs.message_size)) as u16;
+        &emoji_preferences
+    } else {
+        prefs
+    };
     let interaction = interaction.copied().map(|mut interaction| {
         if interaction.is_dragging() {
             let mut indices = document.blocks.iter().enumerate()

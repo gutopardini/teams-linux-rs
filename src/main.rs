@@ -545,6 +545,7 @@ enum AppMessage {
     MessageTextPressed(String, usize, usize, f32, f32, Option<message_selection::Link>),
     MessageTextDragged(String, usize, usize),
     MessageTextReleased,
+    ClearMessageTextSelection,
     PlainTextCopied(Result<(), String>),
     CapturePreview,
     PreviewCaptured(iced::window::Id, iced::window::Screenshot),
@@ -2994,6 +2995,45 @@ fn read_candidate_id(messages: &[GraphMessage], at_bottom: bool, loading: bool) 
         .map(|message| message.id.clone())
 }
 
+fn mark_chat_read_task(state: &mut TeamsApp, chat_id: &str) -> Task<AppMessage> {
+    if state.section != Section::Chats
+        || !state.window_focused
+        || state.settings_open
+        || state.selected_chat.as_deref() != Some(chat_id)
+    {
+        return Task::none();
+    }
+    let Some(message_id) = read_candidate_id(&state.messages, true, state.loading_messages) else {
+        return Task::none();
+    };
+    let already_read = state.read_frontiers.get(chat_id) == Some(&message_id);
+    if already_read || state.pending_read.is_some() {
+        return Task::none();
+    }
+    if state.demo_mode {
+        state.read_frontiers.insert(chat_id.to_owned(), message_id);
+        return Task::none();
+    }
+    let Some(session) = state.session.clone() else {
+        return Task::none();
+    };
+    let epoch = state.session_epoch;
+    let chat_id = chat_id.to_owned();
+    state.pending_read = Some(PendingRead {
+        epoch,
+        chat_id: chat_id.clone(),
+        message_id: message_id.clone(),
+    });
+    let request_chat_id = chat_id.clone();
+    let request_message_id = message_id.clone();
+    Task::perform(
+        background::run(move || {
+            graph::mark_chat_read(session, &request_chat_id, &request_message_id)
+        }),
+        move |result| AppMessage::MarkReadFinished(epoch, chat_id, message_id, result),
+    )
+}
+
 fn read_receipt_marker_indices(
     messages: &[GraphMessage],
     receipts: &[ost::api::ReadReceipt],
@@ -3832,18 +3872,20 @@ impl TeamsApp {
         let mut people = Vec::new();
         let mut names = None;
         for sender in &senders {
-            if let Some(name) = sender
-                .display_name
-                .as_deref()
-                .and_then(sender_names::known)
-            {
-                people.push((sender.person_id.clone(), name.to_owned()));
-                continue;
-            }
-            let names = names.get_or_insert_with(|| self.identity_names());
-            let resolved = sender_names::resolve("", Some(&sender.person_id), names);
+            let direct_name = sender.display_name.as_deref().and_then(sender_names::known);
+            let resolved = direct_name.map(str::to_owned).unwrap_or_else(|| {
+                let names = names.get_or_insert_with(|| self.identity_names());
+                sender_names::resolve("", Some(&sender.person_id), names)
+            });
             if let Some(name) = sender_names::known(&resolved) {
                 people.push((sender.person_id.clone(), name.to_owned()));
+            }
+        }
+        if people.is_empty() && senders.len() == 1 {
+            if let Some(chat) = self.chats.iter().find(|chat| chat.id == chat_id && !chat.is_group)
+                && let Some(name) = sender_names::known(&chat.title)
+            {
+                people.push((senders[0].person_id.clone(), name.to_owned()));
             }
         }
         let label = match people.as_slice() {
@@ -3854,14 +3896,14 @@ impl TeamsApp {
             ]),
             _ => tr("Several people are typing").to_owned(),
         };
-        let mut line = row![].spacing(8).align_y(Alignment::Center);
+        let mut line = row![].spacing(12).align_y(Alignment::Center);
         if let [one] = people.as_slice() {
             line = line.push(self.typing_avatar(&one.1, &one.0));
         }
         line = line
             .push(
-                text(preview_line(&label, 72))
-                    .size(13)
+                text(label)
+                    .size(16)
                     .style(ui_text(Tone::Secondary)),
             )
             .push(chat_sidebar_ui::typing_dots(self.typing_pulse, true));
@@ -3869,7 +3911,7 @@ impl TeamsApp {
     }
 
     fn typing_avatar(&self, label: &str, person_id: &str) -> Element<'static, AppMessage> {
-        const SIZE: f32 = 24.0;
+        const SIZE: f32 = 32.0;
         if let Some(photo) = self.avatars.photo(person_id) {
             image(photo.clone())
                 .width(SIZE)
@@ -8513,12 +8555,6 @@ impl TeamsApp {
             tr("Format message"),
         );
         let mut compose = column![].spacing(8);
-        if self.section == Section::Chats
-            && let Some(chat_id) = self.selected_chat.clone()
-            && let Some(banner) = self.typing_banner(&chat_id)
-        {
-            compose = compose.push(banner);
-        }
         if let Some(target) = self.active_reply_target() {
             let date = target
                 .context
@@ -8883,6 +8919,27 @@ impl TeamsApp {
                 self.demo_mode,
                 self.composer_uses_editor(),
             )
+        };
+
+        let typing_banner = if self.section == Section::Chats {
+            self.selected_chat.as_deref().and_then(|chat_id| self.typing_banner(chat_id))
+        } else {
+            None
+        };
+        let composer: Element<'_, AppMessage> = if let Some(banner) = typing_banner {
+            column![
+                container(banner)
+                    .padding(iced::Padding { left: 30.0, bottom: 4.0, ..Default::default() })
+                    .width(Fill)
+                    .max_width(appearance::metrics::COMPOSER_WIDTH),
+                composer,
+            ]
+            .spacing(0)
+            .width(Fill)
+            .max_width(appearance::metrics::COMPOSER_WIDTH)
+            .into()
+        } else {
+            composer
         };
 
         let composer:Element<'_,AppMessage>=if quote_compose&&self.editing_message_id.is_none() {
@@ -10338,8 +10395,26 @@ fn meeting_desktop_notice_ticks() -> impl iced::futures::Stream<Item = AppMessag
     })
 }
 
+fn message_selection_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    _: iced::window::Id,
+) -> Option<AppMessage> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+            if status != iced::event::Status::Captured =>
+        {
+            Some(AppMessage::ClearMessageTextSelection)
+        }
+        _ => None,
+    }
+}
+
 fn subscription(state: &TeamsApp) -> iced::Subscription<AppMessage> {
-    let mut subscriptions = vec![iced::event::listen_with(window_event_message)];
+    let mut subscriptions = vec![
+        iced::event::listen_with(window_event_message),
+        iced::event::listen_with(message_selection_event),
+    ];
     if call_window_wants_video_frames(state) {
         subscriptions.push(iced::Subscription::run(camera_ticks));
     }
@@ -10843,6 +10918,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             | AppMessage::MessageTextPressed(..)
             | AppMessage::MessageTextDragged(..)
             | AppMessage::MessageTextReleased
+            | AppMessage::ClearMessageTextSelection
     );
     let draft_revision = state.draft_store_revision;
     let session_epoch = state.session_epoch;
@@ -12358,6 +12434,11 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             }
             Task::none()
         }
+        AppMessage::ClearMessageTextSelection => {
+            state.message_text_selection = None;
+            state.message_text_link = None;
+            Task::none()
+        }
         AppMessage::CloseMessageMenu => {
             if state.pending_message_mutation.is_none() {
                 state.delete_confirmation_for = None;
@@ -13430,46 +13511,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     },
                 ));
             }
-            if let Some(message_id) = (state.section == Section::Chats)
-                .then(|| read_candidate_id(&state.messages, at_bottom, state.loading_messages))
-                .flatten()
-            {
-                let already_read = state
-                    .read_frontiers
-                    .get(&chat_id)
-                    .is_some_and(|frontier| frontier == &message_id);
-                let same_request_pending = state.pending_read.as_ref().is_some_and(|pending| {
-                    pending.chat_id == chat_id && pending.message_id == message_id
-                });
-                if !already_read && !same_request_pending && state.pending_read.is_none() {
-                    if state.demo_mode {
-                        state.read_frontiers.insert(chat_id, message_id);
-                    } else if let Some(session) = state.session.clone() {
-                        let epoch = state.session_epoch;
-                        let request_chat_id = chat_id.clone();
-                        let request_message_id = message_id.clone();
-                        state.pending_read = Some(PendingRead {
-                            epoch,
-                            chat_id: chat_id.clone(),
-                            message_id: message_id.clone(),
-                        });
-                        tasks.push(Task::perform(
-                            background::run(move || graph::mark_chat_read(
-                                    session,
-                                    &request_chat_id,
-                                    &request_message_id,
-                                )),
-                            move |result| {
-                                AppMessage::MarkReadFinished(
-                                    epoch,
-                                    chat_id,
-                                    message_id,
-                                    result,
-                                )
-                            },
-                        ));
-                    }
-                }
+            if at_bottom {
+                tasks.push(mark_chat_read_task(state, &chat_id));
             }
             Task::batch(tasks)
         }
@@ -17355,7 +17398,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     | GlobalMessageJumpProgress::NotPending => {}
                 }
                 if state.section == Section::Chats {
-                    return scroll_to_latest();
+                    let read = mark_chat_read_task(state, &chat_id);
+                    return Task::batch([scroll_to_latest(), read]);
                 }
             }
             Task::none()
