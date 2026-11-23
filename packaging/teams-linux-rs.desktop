@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Teams Linux
+Comment=Experimental native client for Linux
+Comment[pt_BR]=Cliente nativo experimental para Linux
+Exec=teams-linux-rs
+Icon=io.github.gutopardini.TeamsLinux
+StartupWMClass=io.github.gutopardini.TeamsLinux
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+StartupNotify=true

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="tile" x1="90" y1="48" x2="426" y2="470" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8984F5"/><stop offset=".55" stop-color="#635BCD"/><stop offset="1" stop-color="#45388D"/>
+    </linearGradient>
+    <linearGradient id="people" x1="222" y1="220" x2="283" y2="370" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/><stop offset="1" stop-color="#DFDDFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="36" y="44" width="440" height="440" rx="110" fill="#30265F" opacity=".22"/>
+  <rect x="36" y="28" width="440" height="440" rx="110" fill="url(#tile)"/>
+  <rect x="37" y="29" width="438" height="438" rx="109" stroke="#B8B4FF" stroke-opacity=".35" stroke-width="2"/>
+  <circle cx="348" cy="165" r="33" fill="#C9C6FF"/>
+  <path d="M310 218h68a22 22 0 0 1 22 22v61a56 56 0 0 1-112 0v-61a22 22 0 0 1 22-22Z" fill="#C9C6FF"/>
+  <circle cx="231" cy="145" r="48" fill="#FFFFFF"/>
+  <path d="M159 218h144a23 23 0 0 1 23 23v70a95 95 0 0 1-190 0v-70a23 23 0 0 1 23-23Z" fill="url(#people)"/>
+  <path d="M285 293h104a30 30 0 0 1 30 30v47a30 30 0 0 1-30 30h-41l-35 26v-26h-28a30 30 0 0 1-30-30v-47a30 30 0 0 1 30-30Z" fill="#42358D"/>
+  <circle cx="295" cy="346" r="8" fill="#FFFFFF"/>
+  <circle cx="337" cy="346" r="8" fill="#FFFFFF"/>
+  <circle cx="379" cy="346" r="8" fill="#FFFFFF"/>
+</svg>

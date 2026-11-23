@@ -1,0 +1,163 @@
+//! Trouter WebSocket connection and frame handling
+
+use anyhow::{Context, Result};
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+use super::session::SessionResponse;
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+pub struct TrouterSocket {
+    stream: WsStream,
+}
+
+impl TrouterSocket {
+    /// Connect to the Trouter WebSocket endpoint.
+    ///
+    /// Auth is handled by the session ID in the URL (obtained via authenticated GET).
+    /// No auth headers or messages needed on the WebSocket itself.
+    pub async fn connect(session: &SessionResponse, session_id: &str, epid: &str) -> Result<Self> {
+        let ws_url = session.ws_url(session_id, epid);
+        let ws_url = ws_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://");
+
+        Self::connect_url(&ws_url).await
+    }
+
+    async fn connect_url(ws_url: &str) -> Result<Self> {
+        // The URL contains session identifiers; do not include it in logs.
+        tracing::info!("Connecting Trouter WebSocket");
+        let (stream, response) = connect_async(ws_url)
+            .await
+            .context("WebSocket connection failed")?;
+        tracing::info!("WebSocket connected (status={})", response.status());
+        Ok(Self { stream })
+    }
+
+    /// Send a text frame.
+    pub async fn send_text(&mut self, msg: &str) -> Result<()> {
+        tracing::debug!("WS send text frame ({} bytes)", msg.len());
+        self.stream
+            .send(Message::Text(msg.to_string()))
+            .await
+            .context("Failed to send WebSocket message")
+    }
+
+    /// Receive the next text frame, ignoring pings/pongs.
+    ///
+    /// Automatically sends HTTP 200 responses for Trouter data frame deliveries.
+    /// Trouter uses HTTP-over-WebSocket: each `3:::` data frame contains an `"id"` field.
+    /// The client MUST respond with `3:::{"id":N,"status":200}` to confirm delivery.
+    /// Without this, Trouter returns 504 to the sender (e.g. Call Controller),
+    /// which kills calls with error 430/10065.
+    pub async fn recv_frame(&mut self) -> Result<Option<String>> {
+        loop {
+            match self.stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    // Auto-respond to Trouter data frame deliveries (3::: HTTP-over-WS)
+                    if let Some(req_id) = extract_trouter_request_id(&text) {
+                        let resp = format!("3:::{{\"id\":{},\"status\":200}}", req_id);
+                        if let Err(e) = self.stream.send(Message::Text(resp)).await {
+                            tracing::warn!("Failed to send Trouter response: {:#}", e);
+                        }
+                    }
+
+                    // Auto-ack Socket.IO event frames (5:ID::)
+                    // Without acks, the server retries indefinitely and blocks new events.
+                    if let Some(ack_id) = extract_socketio_ack_id(&text) {
+                        let ack = format!("6:{}::", ack_id);
+                        if let Err(e) = self.stream.send(Message::Text(ack)).await {
+                            tracing::warn!("Failed to send Socket.IO ack: {:#}", e);
+                        }
+                    }
+
+                    return Ok(Some(text));
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    self.stream
+                        .send(Message::Pong(data))
+                        .await
+                        .context("Failed to send pong")?;
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    tracing::info!("WebSocket closed: {:?}", frame);
+                    return Ok(None);
+                }
+                Some(Ok(other)) => {
+                    let frame_kind = match other {
+                        Message::Binary(_) => "binary",
+                        Message::Pong(_) => "pong",
+                        Message::Frame(_) => "raw",
+                        Message::Text(_) => "text",
+                        Message::Ping(_) => "ping",
+                        Message::Close(_) => "close",
+                    };
+                    tracing::debug!("WS frame ignored ({})", frame_kind);
+                }
+                Some(Err(e)) => {
+                    return Err(e).context("WebSocket receive error");
+                }
+                None => {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Extract the Trouter request ID from a `3:::` data frame.
+///
+/// Trouter HTTP-over-WS data frames (`3:::`) contain `"id":NNN` at the JSON top level.
+/// Only `3:::` frames use this mechanism; `5:` event frames use Socket.IO acks instead.
+fn extract_trouter_request_id(frame: &str) -> Option<i64> {
+    let json_str = frame.strip_prefix("3:::")?;
+    // Fast path: find "id": near the start of JSON to avoid full parse
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    v.get("id").and_then(|id| id.as_i64())
+}
+
+/// Extract Socket.IO event ack ID from a `5:ID::` frame.
+///
+/// Socket.IO v1 event frames have format `5:ACK_ID:ENDPOINT:JSON`.
+/// Returns the numeric ack ID if present.
+fn extract_socketio_ack_id(frame: &str) -> Option<u64> {
+    let rest = frame.strip_prefix("5:")?;
+    let colon_pos = rest.find(':')?;
+    let id_part = &rest[..colon_pos];
+    if id_part.is_empty() {
+        return None;
+    }
+    id_part.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::accept_async;
+
+    #[tokio::test]
+    async fn websocket_delivery_ack_and_short_url_dispatch_use_the_same_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let frame = r#"3::: {"id":41,"method":"POST","shortUrl":"callAgent/session/nonce/call/acceptance/","body":{"callAcceptance":{}}}"#;
+            ws.send(Message::Text(frame.to_owned())).await.unwrap();
+            let Some(Ok(Message::Text(ack))) = ws.next().await else { panic!("missing delivery ack"); };
+            assert_eq!(serde_json::from_str::<serde_json::Value>(ack.strip_prefix("3:::").unwrap()).unwrap(), serde_json::json!({"id":41,"status":200}));
+        });
+        let mut client = TrouterSocket::connect_url(&format!("ws://{addr}")).await.unwrap();
+        let frame = client.recv_frame().await.unwrap().unwrap();
+        let payload = frame.strip_prefix("3::: ").unwrap();
+        let event = super::super::data_frame_routed_event(payload).unwrap();
+        assert_eq!(event.kind, crate::event_hub::TrouterEventKind::CallSignal);
+        let decoded: serde_json::Value = serde_json::from_str(&event.payload_json).unwrap();
+        assert_eq!(decoded["shortUrl"], "callAgent/session/nonce/call/acceptance/");
+        assert!(decoded.get("url").is_none());
+        server.await.unwrap();
+    }
+}

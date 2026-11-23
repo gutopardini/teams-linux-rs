@@ -1,0 +1,24 @@
+[package]
+name = "teams-av"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license-file = "../../LICENSE"
+
+[workspace]
+
+[features]
+test-support = []
+
+[dependencies]
+libwebrtc = { version = "=0.3.51", path = "../../vendor/libwebrtc", features = ["glib-main-loop"] }
+futures-util = "0.3"
+rand = "0.8.5"
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[patch.crates-io]
+webrtc-sys = { path = "../../vendor/webrtc-sys" }

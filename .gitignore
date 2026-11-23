@@ -1,0 +1,32 @@
+/target
+/.env
+
+# Local original artifacts for reproducible REA, never package or commit
+.research-cache/
+
+# Build outputs in the application and vendored crates
+target/
+
+# Local configuration, credentials and IDE state
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3
+*.db
+
+# Generated diagnostics and interpreter caches
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Original installer packages stay local to REA work
+*.msix
+*.msixbundle
+*.msi

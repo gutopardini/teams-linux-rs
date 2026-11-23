@@ -1,0 +1,14 @@
+{
+  "properties": {
+    "originalMessageContext": {
+      "originalMessageId": "original-42",
+      "originalSenderMri": "8:orgid:aaaaaaaa-1111-2222-3333-444444444444",
+      "originalArrivalTime": "2026-10-26T12:30:00Z",
+      "originalMessageContent": "<p><strong>Release aprovado</strong></p>",
+      "originalMessageType": "RichText/Html",
+      "originalChannelPostSubject": "Publicação da versão",
+      "originalAnnouncement": true,
+      "originalMessageIsDeleted": false
+    }
+  }
+}

@@ -1,0 +1,12 @@
+* text=auto
+*.rs text eol=lf
+*.py text eol=lf
+*.md text eol=lf whitespace=-blank-at-eol
+*.toml text eol=lf
+*.json text eol=lf
+*.bin binary
+*.ttf binary
+*.png binary
+*.rgba binary
+# Preserve upstream license text, including its original whitespace.
+assets/fonts/*LICENSE* -whitespace
