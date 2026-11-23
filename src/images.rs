@@ -1304,6 +1304,13 @@ pub fn valid_media_url(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
         return false;
     };
+    if is_public_gif_url(&url) {
+        return true;
+    }
+    is_teams_media_url(&url)
+}
+
+fn is_teams_media_url(url: &url::Url) -> bool {
     let host = url.host_str().unwrap_or("");
     url.scheme() == "https"
         && url.username().is_empty()
@@ -1314,6 +1321,24 @@ pub fn valid_media_url(value: &str) -> bool {
             || host.ends_with(".asyncgw.teams.microsoft.com"))
         && url.path().starts_with("/v1/objects/")
         && url.path().contains("/views/")
+}
+
+fn is_public_gif_url(url: &url::Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let giphy_cdn = host == "media.giphy.com"
+        || host.strip_prefix("media").is_some_and(|suffix| {
+            let (number, domain) = suffix.split_once('.').unwrap_or(("", ""));
+            !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+                && domain == "giphy.com"
+        });
+    let tenor_cdn = matches!(host.as_str(), "media.tenor.com" | "c.tenor.com");
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && (giphy_cdn || tenor_cdn)
+        && url.path().to_ascii_lowercase().ends_with(".gif")
 }
 
 fn agent() -> &'static ureq::Agent {
@@ -1550,7 +1575,7 @@ pub fn download(session: TeamsSession, url: &str) -> Result<LoadedImage, String>
 /// `imgpsh_mobile_save`). The original bytes are the `imgo` view of the
 /// same object. Views that are already full stay untouched.
 pub fn full_resolution_url(url: &str) -> String {
-    if !valid_media_url(url) {
+    if !url::Url::parse(url).ok().as_ref().is_some_and(is_teams_media_url) {
         return url.to_owned();
     }
     let Some(marker) = url.find("/views/") else {
@@ -1588,7 +1613,7 @@ fn preview_bitmap(image: image_codec::DynamicImage) -> image_codec::RgbaImage {
 }
 
 fn view_span(url: &str) -> Option<(usize, usize)> {
-    if !valid_media_url(url) {
+    if !url::Url::parse(url).ok().as_ref().is_some_and(is_teams_media_url) {
         return None;
     }
     let marker = url.find("/views/")?;
@@ -1730,6 +1755,9 @@ fn download_bytes_with_timeout(
     url: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
+    if url::Url::parse(url).ok().as_ref().is_some_and(is_public_gif_url) {
+        return download_public_gif_bytes(url, timeout);
+    }
     if !valid_media_url(url) {
         return Err("Endereço de imagem inesperado.".into());
     }
@@ -1756,6 +1784,48 @@ fn download_bytes_with_timeout(
         return Err("A imagem ultrapassa o limite de 32 MB.".into());
     }
     Ok(bytes)
+}
+
+fn download_public_gif_bytes(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut current = url::Url::parse(url).map_err(|_| "Endereço de imagem inesperado.".to_owned())?;
+    for _ in 0..=3 {
+        if !is_public_gif_url(&current) {
+            return Err("Endereço de imagem inesperado.".into());
+        }
+        let mut response = agent()
+            .get(current.as_str())
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
+            .call()
+            .map_err(|_| "Não foi possível carregar o GIF.".to_owned())?;
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "O GIF retornou um endereço inválido.".to_owned())?;
+            current = current
+                .join(location)
+                .map_err(|_| "O GIF retornou um endereço inválido.".to_owned())?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err("GIF indisponível.".into());
+        }
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take((MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Download interrompido.".to_owned())?;
+        if bytes.len() > MAX_BYTES {
+            return Err("O GIF ultrapassa o limite de 32 MB.".into());
+        }
+        return Ok(bytes);
+    }
+    Err("O GIF redirecionou muitas vezes.".into())
 }
 
 #[derive(Default)]
