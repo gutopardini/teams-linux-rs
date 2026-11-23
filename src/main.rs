@@ -7028,6 +7028,7 @@ impl TeamsApp {
                         Some(&message_selection::Interaction {
                             message_id: &forwarded_selection_id,
                             selection: self.message_text_selection.as_ref(),
+                            text_edges: None,
                         }),
                     ));
                 }
@@ -7245,6 +7246,7 @@ impl TeamsApp {
                     Some(&message_selection::Interaction {
                         message_id: message.id.as_str(),
                         selection: self.message_text_selection.as_ref(),
+                        text_edges: None,
                     }),
                 ));
             }
@@ -12273,6 +12275,9 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     block,
                     offset: message_selection::snap_offset(&blocks[block], offset),
                 };
+                if selection.caret != selection.anchor {
+                    state.message_text_link = None;
+                }
             }
             Task::none()
         }

@@ -1,5 +1,6 @@
 //! Drag selects part of a message. A second click on the same spot selects it all.
 use crate::AppMessage;
+use iced::advanced::graphics::text::{Paragraph as GraphicsParagraph, cosmic_text::BidiParagraphs};
 use iced::advanced::text::{self, Paragraph};
 use iced::advanced::widget::{Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer};
@@ -38,6 +39,7 @@ pub struct MessageTextSelection {
 pub struct Interaction<'a> {
     pub message_id: &'a str,
     pub selection: Option<&'a MessageTextSelection>,
+    pub text_edges: Option<(usize, usize)>,
 }
 
 impl<'a> Interaction<'a> {
@@ -53,10 +55,14 @@ impl<'a> Interaction<'a> {
             .is_some_and(|item| item.dragging && item.message_id == self.message_id)
     }
 
-    pub fn caret_in_block(self, block: usize) -> Option<usize> {
-        self.selection
-            .filter(|item| item.dragging && item.message_id == self.message_id && item.caret.block == block)
-            .map(|item| item.caret.offset)
+    pub fn drag_in_block(self, block: usize) -> Option<Drag> {
+        let selection = self.selection.filter(|item| item.dragging && item.message_id == self.message_id)?;
+        let (first_block, last_block) = self.text_edges?;
+        Some(Drag {
+            caret: (selection.caret.block == block).then_some(selection.caret.offset),
+            first: block == first_block,
+            last: block == last_block,
+        })
     }
 }
 
@@ -182,13 +188,19 @@ fn ordered(anchor: TextPoint, caret: TextPoint) -> (TextPoint, TextPoint) {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct Drag {
+    caret: Option<usize>,
+    first: bool,
+    last: bool,
+}
+
 pub fn selectable<'a>(
     spans: Vec<Span<'a, Link, Font>>,
     visible: String,
     message_id: String,
     block: usize,
-    dragging: bool,
-    caret: Option<usize>,
+    drag: Option<Drag>,
     size: f32,
     line_height: f32,
 ) -> Element<'a, AppMessage> {
@@ -202,8 +214,7 @@ pub fn selectable<'a>(
         visible,
         message_id,
         block,
-        dragging,
-        caret,
+        drag,
         size,
         line_height,
     })
@@ -215,33 +226,57 @@ struct Selectable<'a, R: renderer::Renderer = iced::Renderer> {
     visible: String,
     message_id: String,
     block: usize,
-    dragging: bool,
-    caret: Option<usize>,
+    drag: Option<Drag>,
     size: f32,
     line_height: f32,
 }
 
-struct State<P: Paragraph> {
-    hit_test: RefCell<Option<HitTest<P>>>,
+struct State {
+    hit_test: RefCell<Option<HitTest>>,
     bounds: Size,
     pressed: bool,
 }
 
 #[derive(Default)]
-struct HitTest<P: Paragraph> {
-    spans: Vec<Span<'static, Link, P::Font>>,
-    paragraph: P,
+struct HitTest {
+    spans: Vec<Span<'static, Link, Font>>,
+    paragraph: GraphicsParagraph,
 }
 
 impl<R: text::Renderer<Font = Font>> Selectable<'_, R> {
-    fn cursor_offset(&self, state: &State<R::Paragraph>, local: Point, renderer: &R) -> usize {
+    fn cursor_offset(&self, state: &State, local: Point, renderer: &R) -> usize {
         let mut hit_test = state.hit_test.borrow_mut();
         let hit_test = hit_test.get_or_insert_with(HitTest::default);
         sync_paragraph(hit_test, renderer, state.bounds, &self.spans, self.size, self.line_height);
-        let offset = hit_test.paragraph.hit_test(local).map(|hit| hit.cursor()).unwrap_or_else(|| {
+        let offset = hit_test.paragraph.buffer().hit(local.x, local.y).map(|hit| {
+            // The shaped buffer reports a byte offset relative to the logical line.
+            let line_start = if hit.line == 0 {
+                0
+            } else {
+                BidiParagraphs::new(&self.visible)
+                    .nth(hit.line)
+                    .map_or(0, |line| line.as_ptr() as usize - self.visible.as_ptr() as usize)
+            };
+            line_start + hit.index
+        }).unwrap_or_else(|| {
             if local.y > hit_test.paragraph.min_height() / 2.0 { self.visible.len() } else { 0 }
         });
         snap_offset(&self.visible, offset)
+    }
+
+    fn drag_offset(&self, state: &State, cursor: mouse::Cursor, bounds: Rectangle, renderer: &R) -> Option<usize> {
+        let Some(drag) = self.drag else {
+            return cursor.position_in(bounds).filter(|_| state.pressed)
+                .map(|local| self.cursor_offset(state, local, renderer));
+        };
+        let local = cursor.land().position_from(bounds.position())?;
+        if local.y < 0.0 {
+            return drag.first.then_some(0);
+        }
+        if local.y >= bounds.height {
+            return drag.last.then_some(self.visible.len());
+        }
+        Some(self.cursor_offset(state, local, renderer))
     }
 }
 
@@ -250,11 +285,11 @@ where
     R: renderer::Renderer + text::Renderer<Font = Font>,
 {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State<R::Paragraph>>()
+        tree::Tag::of::<State>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::<R::Paragraph> {
+        tree::State::new(State {
             hit_test: RefCell::new(None),
             bounds: Size::ZERO,
             pressed: false,
@@ -274,7 +309,7 @@ where
     }
 
     fn layout(&mut self, tree: &mut Tree, renderer: &R, limits: &layout::Limits) -> layout::Node {
-        tree.state.downcast_mut::<State<R::Paragraph>>().bounds = limits.max();
+        tree.state.downcast_mut::<State>().bounds = limits.max();
         self.inner
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
@@ -292,7 +327,7 @@ where
         _viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let state = tree.state.downcast_mut::<State<R::Paragraph>>();
+        let state = tree.state.downcast_mut::<State>();
         let local = cursor.position_in(bounds);
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if local.is_some() => {
@@ -310,11 +345,10 @@ where
                 ));
                 shell.capture_event();
             }
-            Event::Mouse(mouse::Event::CursorMoved { .. })
-                if (self.dragging || state.pressed) && local.is_some() =>
-            {
-                let offset = self.cursor_offset(state, local.unwrap(), renderer);
-                if self.caret != Some(offset) {
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let Some(offset) = self.drag_offset(state, cursor, bounds, renderer)
+                    && self.drag.and_then(|drag| drag.caret) != Some(offset)
+                {
                     shell.publish(AppMessage::MessageTextDragged(
                         self.message_id.clone(),
                         self.block,
@@ -323,7 +357,7 @@ where
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if self.dragging || state.pressed =>
+                if state.pressed || self.drag.is_some_and(|drag| drag.first) =>
             {
                 state.pressed = false;
                 shell.publish(AppMessage::MessageTextReleased);
@@ -362,7 +396,7 @@ where
         _viewport: &Rectangle,
         renderer: &R,
     ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<State<R::Paragraph>>();
+        let state = tree.state.downcast_ref::<State>();
         let Some(local) = cursor.position_in(layout.bounds()) else { return mouse::Interaction::None; };
         if self.spans.iter().any(|span| span.link.is_some())
             && link_at(&self.spans, self.cursor_offset(state, local, renderer)).is_some()
@@ -383,7 +417,7 @@ fn link_at(spans: &[Span<'_, Link, Font>], offset: usize) -> Option<Link> {
 }
 
 fn sync_paragraph<R>(
-    state: &mut HitTest<R::Paragraph>,
+    state: &mut HitTest,
     renderer: &R,
     bounds: Size,
     spans: &[Span<'_, Link, Font>],
@@ -407,7 +441,7 @@ fn sync_paragraph<R>(
         wrapping: Wrapping::WordOrGlyph,
     };
     if state.spans != spans {
-        state.paragraph = R::Paragraph::with_spans(text_with_spans());
+        state.paragraph = GraphicsParagraph::with_spans(text_with_spans());
         state.spans = spans.iter().cloned().map(Span::to_static).collect();
     } else {
         match state.paragraph.compare(text::Text {
@@ -423,7 +457,7 @@ fn sync_paragraph<R>(
         }) {
             text::Difference::None => {}
             text::Difference::Bounds => state.paragraph.resize(bounds),
-            text::Difference::Shape => state.paragraph = R::Paragraph::with_spans(text_with_spans()),
+            text::Difference::Shape => state.paragraph = GraphicsParagraph::with_spans(text_with_spans()),
         }
     }
 }
@@ -433,18 +467,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clicking_a_link_after_an_explicit_break_uses_its_document_offset() {
+        let leading = "📝 Revisão\n";
+        let label = "Open the example";
+        let link = Link::Web("https://example.test/review".into());
+        let mut widget = selectable(
+            vec![Span::new(leading), Span::new(label).link(link.clone())],
+            format!("{leading}{label}"), "example".into(), 0, None, 16.0, 1.35,
+        );
+        let renderer = crate::chat_render_tests::headless_renderer();
+        let mut tree = Tree::new(widget.as_widget());
+        let viewport = Rectangle::with_size(Size::new(240.0, 240.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut messages = Vec::new();
+        widget.as_widget_mut().update(
+            &mut tree, &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node), mouse::Cursor::Available(Point::new(8.0, 30.0)),
+            &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport,
+        );
+        assert!(matches!(messages.as_slice(),
+            [AppMessage::MessageTextPressed(_, 0, offset, _, _, Some(found))]
+                if *offset >= leading.len() && *found == link));
+    }
+
+    #[test]
+    fn dragging_across_a_multiline_message_copies_the_first_and_last_lines() {
+        use crate::{GraphMessage, TeamsApp, message_body, selected_visible_text};
+        use std::sync::Arc;
+
+        let document = Arc::new(message_body::Document::from_html(concat!(
+            "<p>📝 Revisão<br>Confira as alterações no ambiente de teste.</p>",
+            "<p><a href='https://example.test/review'>Abrir revisão</a></p>",
+        )).unwrap());
+        let renderer = crate::chat_render_tests::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(600.0, 400.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let expected = "📝 Revisão\nConfira as alterações no ambiente de teste.\nAbrir revisão";
+        let view = |state: &TeamsApp| {
+            message_body::view_with_media(
+                Some(&document), "", &state.preferences, &Theme::Dark, false,
+                &state.media, viewport.width, Some(&Interaction {
+                    message_id: "example",
+                    selection: state.message_text_selection.as_ref(),
+                    text_edges: None,
+                }),
+            )
+        };
+
+        for backwards in [false, true] {
+            let mut state = TeamsApp::from_client_id(String::new());
+            state.messages = vec![GraphMessage {
+                id: "example".into(), rich: Some(document.clone()), ..GraphMessage::default()
+            }];
+            let mut widget = view(&state);
+            let mut tree = Tree::new(widget.as_widget());
+            let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let first = Layout::new(&node).children().next().unwrap().bounds();
+            let last = Layout::new(&node).children().last().unwrap().bounds();
+            let (press, moved) = if backwards {
+                (Point::new(last.x + last.width - 0.1, last.y + 5.0), Point::new(460.0, first.y - 4.0))
+            } else {
+                (Point::new(first.x + 0.1, first.y + 5.0), Point::new(460.0, last.y + 5.0))
+            };
+            for (event, position) in [
+                (mouse::Event::ButtonPressed(mouse::Button::Left), press),
+                (mouse::Event::CursorMoved { position: moved }, moved),
+                (mouse::Event::ButtonReleased(mouse::Button::Left), moved),
+            ] {
+                let mut widget = view(&state);
+                tree.diff(widget.as_widget());
+                let node = widget.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                let mut messages = Vec::new();
+                widget.as_widget_mut().update(
+                    &mut tree, &Event::Mouse(event), Layout::new(&node),
+                    mouse::Cursor::Available(position), &renderer,
+                    &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport,
+                );
+                for message in messages {
+                    drop(crate::update(&mut state, message));
+                }
+            }
+            assert_eq!(selected_visible_text(&state).as_deref(), Some(expected), "backwards={backwards}");
+            assert!(state.message_text_selection.is_some_and(|selection| !selection.dragging));
+        }
+    }
+
+    #[test]
     fn first_click_resolves_a_link_after_layout_and_wrap_changes() {
-        type TextState = State<<iced::Renderer as text::Renderer>::Paragraph>;
         let value = "Open the original message";
         let link = Link::Web("https://example.test".into());
         let spans = vec![Span::new(value).link(link.clone())];
-        let mut widget = selectable(spans, value.into(), "msg".into(), 0, false, None, 16.0, 1.35);
+        let mut widget = selectable(spans, value.into(), "msg".into(), 0, None, 16.0, 1.35);
         let renderer = crate::chat_render_tests::headless_renderer();
         let mut tree = Tree::new(widget.as_widget());
         let wide = layout::Limits::new(Size::ZERO, Size::new(300.0, 300.0));
         let narrow = layout::Limits::new(Size::ZERO, Size::new(82.0, 300.0));
         let first = widget.as_widget_mut().layout(&mut tree, &renderer, &wide);
-        assert!(tree.state.downcast_ref::<TextState>().hit_test.borrow().is_none());
+        assert!(tree.state.downcast_ref::<State>().hit_test.borrow().is_none());
         assert_eq!(widget.as_widget().mouse_interaction(
             &tree, Layout::new(&first), mouse::Cursor::Available(Point::new(4.0, 8.0)),
             &Rectangle::with_size(wide.max()), &renderer,

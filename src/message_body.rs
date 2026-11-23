@@ -4789,17 +4789,19 @@ pub fn bubble_width(pane: f32, mine: bool, compact: bool) -> f32 {
     }
 }
 
+fn text_runs(block: &Block) -> &[Run] {
+    if block.media.is_some() || block.card.is_some() || block.table.is_some() {
+        &[]
+    } else {
+        &block.runs
+    }
+}
+
 pub fn visible_block_texts(document: &Document) -> Vec<String> {
     document
         .blocks
         .iter()
-        .map(|block| {
-            if block.media.is_some() || block.card.is_some() || block.table.is_some() {
-                String::new()
-            } else {
-                block.runs.iter().map(|run| run.text.as_str()).collect()
-            }
-        })
+        .map(|block| text_runs(block).iter().map(|run| run.text.as_str()).collect())
         .collect()
 }
 
@@ -4820,6 +4822,17 @@ pub fn view_with_media(
         plain = Document::plain(fallback);
         &plain
     };
+    let interaction = interaction.copied().map(|mut interaction| {
+        if interaction.is_dragging() {
+            let mut indices = document.blocks.iter().enumerate()
+                .filter(|(_, block)| text_runs(block).iter().any(|run| !run.text.is_empty()))
+                .map(|(index, _)| index);
+            interaction.text_edges = indices.next().map(|first| {
+                (first, indices.next_back().unwrap_or(first))
+            });
+        }
+        interaction
+    });
     let mut content = column![];
     let mut index = 0;
     while index < document.blocks.len() {
@@ -4839,7 +4852,7 @@ pub fn view_with_media(
                 mine,
                 media,
                 max_image_width,
-                interaction,
+                interaction.as_ref(),
                 index,
             ));
             index = end;
@@ -4854,7 +4867,7 @@ pub fn view_with_media(
                 max_image_width,
                 None,
                 None,
-                interaction,
+                interaction.as_ref(),
                 index,
             ));
             index += 1;
@@ -5790,8 +5803,7 @@ fn author_line(
         visible,
         interaction.message_id.to_owned(),
         block_index,
-        interaction.is_dragging(),
-        interaction.caret_in_block(block_index),
+        interaction.drag_in_block(block_index),
         size,
         size * 1.35,
     )
@@ -5910,8 +5922,7 @@ fn render_runs(
             visible,
             interaction.message_id.to_owned(),
             block_index,
-            interaction.is_dragging(),
-            interaction.caret_in_block(block_index),
+            interaction.drag_in_block(block_index),
             size,
             prefs.line_height(),
         );
