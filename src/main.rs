@@ -804,6 +804,8 @@ enum AppMessage {
     GroupTitleChanged(String),
     CreateGroupChat,
     GroupChatCreated(u64, String, Result<(TeamsSession, ChatSummary), String>),
+    OpenGroupPeople,
+    CloseGroupPeople,
     OpenGroupDetails,
     GroupMembersLoaded(u64, u64, String, Result<(TeamsSession, Vec<ChatMemberSummary>), String>),
     SaveGroupTitle,
@@ -2378,6 +2380,7 @@ struct TeamsApp {
     group_title_draft: String,
     creating_group_chat: bool,
     group_details_open: bool,
+    group_people_open: bool,
     group_details_chat_id: Option<String>,
     group_details_sequence: u64,
     mention_composer: mention_composer::State,
@@ -5556,6 +5559,7 @@ impl TeamsApp {
             group_title_draft: String::new(),
             creating_group_chat: false,
             group_details_open: false,
+            group_people_open: false,
             group_details_chat_id: None,
             group_details_sequence: 0,
             mention_composer: mention_composer::State::default(),
@@ -7793,10 +7797,10 @@ impl TeamsApp {
                     .style(ui_text(tone)),
             );
         }
-        hint(
+        let anchor = hint(
             button(content)
                 .padding(if on_primary { 6 } else { 9 })
-                .on_press(AppMessage::OpenGroupDetails)
+                .on_press(AppMessage::OpenGroupPeople)
                 .style(ui_button(
                     Tone::Transparent,
                     Tone::Hover,
@@ -7804,6 +7808,12 @@ impl TeamsApp {
                     6.0,
                 )),
             tr("People in this chat"),
+        );
+        composer_popover::view_with_close(
+            anchor,
+            self.group_people_open.then(|| group_people_popover_view(self)),
+            true,
+            AppMessage::CloseGroupPeople,
         )
     }
 
@@ -15635,6 +15645,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.new_conversation_open = false;
             state.person_card = None;
             state.group_details_open = false;
+            state.group_people_open = false;
             state.group_details_chat_id = None;
             state.group_members_dirty = false;
             state.group_leave_confirmation = false;
@@ -16247,6 +16258,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             }
             if state.group_details_open {
                 state.group_details_open = false;
+                state.group_people_open = false;
                 state.group_details_chat_id = None;
                 state.group_members_dirty = false;
                 state.group_leave_confirmation = false;
@@ -16514,6 +16526,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             };
             state.new_conversation_open = false;
             state.group_details_open = true;
+            state.group_people_open = false;
             state.group_details_chat_id = Some(chat.id.clone());
             state.group_members_dirty = false;
             state.group_leave_confirmation = false;
@@ -16541,6 +16554,21 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 state.session_epoch,
                 state.group_details_sequence,
             )
+        }
+        AppMessage::OpenGroupPeople => {
+            if state.group_people_open {
+                return update_inner(state, AppMessage::CloseGroupPeople);
+            }
+            let task = update_inner(state, AppMessage::OpenGroupDetails);
+            state.group_people_open = state.group_details_open;
+            task
+        }
+        AppMessage::CloseGroupPeople => {
+            if state.group_people_open {
+                state.group_people_open = false;
+                return update_inner(state, AppMessage::CloseNewConversation);
+            }
+            Task::none()
         }
         AppMessage::GroupMembersLoaded(epoch, sequence, chat_id, result) => {
             if epoch != state.session_epoch
@@ -16860,6 +16888,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         state.remember_draft();
                     }
                     state.group_details_open = false;
+                    state.group_people_open = false;
                     state.group_details_chat_id = None;
                     state.group_members_dirty = false;
                     state.group_leave_confirmation = false;
@@ -18415,6 +18444,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.group_title_draft.clear();
             state.creating_group_chat = false;
             state.group_details_open = false;
+            state.group_people_open = false;
             state.group_details_chat_id = None;
             state.group_members_dirty = false;
             state.group_details_sequence = state.group_details_sequence.wrapping_add(1);
@@ -19441,6 +19471,122 @@ fn status_note_view(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMessag
         .into()
 }
 
+fn group_people_popover_view(state: &TeamsApp) -> Element<'_, AppMessage> {
+    let mut rows = column![].spacing(2);
+    if state.group_members_loading && state.group_members.is_empty() {
+        rows = rows.push(
+            container(text(tr("Loading participants…")).size(13).style(ui_text(Tone::Secondary)))
+                .width(Fill)
+                .padding([16, 12]),
+        );
+    } else if state.group_members.is_empty() {
+        let message = state.group_details_error.as_deref().unwrap_or(tr("Could not load the participant list."));
+        rows = rows.push(
+            container(text(message).size(13).style(ui_text(Tone::Secondary)))
+                .width(Fill)
+                .padding([16, 12]),
+        );
+    } else {
+        let owner = avatars::person_id(&state.user_id);
+        let names = state.identity_names();
+        for member in &state.group_members {
+            let is_self = owner.is_some() && owner.as_deref() == member.person_id.as_deref();
+            let name = sender_names::resolve(&member.display_name, member.person_id.as_deref(), &names);
+            let shown = if name == sender_names::UNKNOWN { tr("Participant") } else { name.as_str() };
+            let presence = if is_self {
+                state.presence.own_for_display(Instant::now())
+            } else {
+                member.person_id.as_deref()
+                    .and_then(avatars::person_id)
+                    .and_then(|person_id| state.presence.contact(&person_id, Instant::now()))
+                    .map(|observed| observed.value)
+            };
+            let mut details = column![text(preview_line(shown, 30)).size(14).style(ui_text(Tone::Text))]
+                .spacing(2)
+                .width(Fill);
+            if let Some(status) = presence {
+                details = details.push(
+                    row![
+                        presence_icon(status.availability, 10.0, state.preferences.appearance),
+                        text(status.label()).size(12).style(ui_text(Tone::Secondary)),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                );
+            }
+            rows = rows.push(
+                button(
+                    row![state.person_avatar(shown, member.person_id.as_deref(), 34.0), details]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                )
+                .width(Fill)
+                .padding([7, 10])
+                .on_press(AppMessage::OpenRosterPersonCard(member.clone()))
+                .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Text, 7.0)),
+            );
+        }
+    }
+    let people = scrollable(rows)
+        .direction(scroll_axis())
+        .style(ui_scroll)
+        .height(300.0);
+    let count = state.group_members.len();
+    let footer: Element<'_, AppMessage> = if state.group_leave_confirmation {
+        column![
+            text(tr("This chat will be removed from your list when you leave."))
+                .size(12)
+                .style(ui_text(Tone::Secondary)),
+            row![
+                space::horizontal(),
+                button(text(tr("Cancel")).size(12))
+                    .padding([7, 10])
+                    .on_press(AppMessage::CancelLeaveGroup)
+                    .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Secondary, 6.0)),
+                button(text(tr("Leave group")).size(12))
+                    .padding([7, 10])
+                    .on_press(AppMessage::ConfirmLeaveGroup)
+                    .style(ui_button(Tone::Danger, Tone::Danger, Tone::Text, 6.0)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(7)
+        .into()
+    } else {
+        row![
+            button(text(tr("Add people")).size(13))
+                .padding([7, 9])
+                .on_press(AppMessage::OpenGroupDetails)
+                .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Text, 6.0)),
+            space::horizontal(),
+            button(text(tr("Leave")).size(13))
+                .padding([7, 9])
+                .on_press(AppMessage::LeaveGroup)
+                .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Danger, 6.0)),
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    };
+    container(
+        column![
+            text(format!("{} ({count})", tr("People")))
+                .size(14)
+                .font(semibold())
+                .style(ui_text(Tone::Secondary)),
+            people,
+            divider(),
+            footer,
+        ]
+        .spacing(8)
+        .width(Fill),
+    )
+    .width(310.0)
+    .padding(10)
+    .style(ui_surface(Tone::Surface, true, 9.0))
+    .into()
+}
+
 fn group_details_view(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMessage> {
     let busy = state.saving_group_name
         || state.group_roster_mutation.is_some()
@@ -20298,7 +20444,7 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
             .height(Fill)
             .style(ui_surface(Tone::Canvas, false, 0.0))
             .into();
-            let overlay = if state.group_details_open {
+            let overlay = if state.group_details_open && !state.group_people_open {
                 group_details_view(state, size)
             } else if state.new_conversation_open {
                 new_conversation_view(state, size)
