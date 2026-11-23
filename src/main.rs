@@ -12737,11 +12737,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         state.status = tr("The draft changed during paste. Copy again in the current chat.").into();
                         return Task::none();
                     }
-                    let text = if text.contains('\r') {
-                        text.replace("\r\n", "\n").replace('\r', "\n")
-                    } else {
-                        text
-                    };
+                    let text = message_body::auto_format_pasted_text(&text);
                     if state.composer_uses_editor() || text.contains('\n') {
                         return state.insert_clipboard_document(
                             target,
@@ -12772,7 +12768,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         return state.insert_clipboard_document(
                             target,
                             message_body::ComposerPaste {
-                                text: plain,
+                                text: message_body::auto_format_pasted_text(&plain),
                                 formatting: message_body::ComposerFormatting::default(),
                             },
                             true,

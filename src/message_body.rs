@@ -30,6 +30,112 @@ pub struct ComposerPaste {
     pub text: String,
     pub formatting: ComposerFormatting,
 }
+
+/// Reflows indented prose from plain-text clipboard content while leaving
+/// code-like pastes and their significant indentation intact.
+pub fn auto_format_pasted_text(value: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let lines = normalized.split('\n').collect::<Vec<_>>();
+    let code_like = lines.iter().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("```")
+            || line.contains('\t')
+            || line.chars().take_while(|character| *character == ' ').count() >= 4
+            || trimmed.ends_with('{')
+            || trimmed.starts_with('}')
+            || ["function ", "const ", "let ", "var ", "class ", "def ", "fn ", "import ", "#include "]
+                .iter()
+                .any(|prefix| trimmed.starts_with(prefix))
+    });
+    let normalized_lines = lines
+        .iter()
+        .map(|line| {
+            let line = if code_like { *line } else { line.trim_start() };
+            line.trim_end_matches([' ', '\t'])
+        })
+        .collect::<Vec<_>>();
+    if code_like {
+        return normalized_lines.join("\n");
+    }
+    let has_indentation = lines.iter().any(|line| line.starts_with([' ', '\t']));
+    if !has_indentation {
+        return normalized_lines.join("\n");
+    }
+
+    fn sentence_ends(line: &str) -> bool {
+        let line = line.trim_end();
+        line.chars().last().is_some_and(|character| {
+            matches!(character, '.' | '!' | '?' | ':' | ';')
+        }) || line.graphemes(true).next_back().is_some_and(typography::is_color_emoji)
+    }
+
+    fn is_list_item(line: &str) -> bool {
+        ["• ", "● ", "▪ ", "‣ ", "- ", "* "]
+            .iter()
+            .any(|marker| line.starts_with(marker))
+            || {
+                let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+                digits > 0
+                    && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "))
+            }
+    }
+
+    let mut blocks = Vec::new();
+    let mut paragraph = String::new();
+    let mut list = Vec::<String>::new();
+    let flush_paragraph = |blocks: &mut Vec<String>, paragraph: &mut String| {
+        if !paragraph.is_empty() {
+            blocks.push(std::mem::take(paragraph));
+        }
+    };
+    let flush_list = |blocks: &mut Vec<String>, list: &mut Vec<String>| {
+        if !list.is_empty() {
+            blocks.push(list.join("\n"));
+            list.clear();
+        }
+    };
+
+    for (index, line) in normalized_lines.iter().enumerate() {
+        let raw = lines[index];
+        let indented = raw.starts_with([' ', '\t']);
+        if line.is_empty() {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            flush_list(&mut blocks, &mut list);
+            continue;
+        }
+        if line.starts_with("** ") {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            flush_list(&mut blocks, &mut list);
+            blocks.push((*line).to_owned());
+            continue;
+        }
+        if is_list_item(line) {
+            flush_paragraph(&mut blocks, &mut paragraph);
+            list.push((*line).to_owned());
+            continue;
+        }
+        if indented && let Some(last) = list.last_mut() {
+            if !sentence_ends(last) {
+                last.push(' ');
+                last.push_str(line);
+                continue;
+            }
+        }
+        if !paragraph.is_empty() && !sentence_ends(&paragraph) {
+            paragraph.push(' ');
+            paragraph.push_str(line);
+            continue;
+        }
+        flush_list(&mut blocks, &mut list);
+        flush_paragraph(&mut blocks, &mut paragraph);
+        paragraph.push_str(line);
+    }
+    flush_paragraph(&mut blocks, &mut paragraph);
+    flush_list(&mut blocks, &mut list);
+    blocks.join("\n\n")
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Block {
     pub runs: Vec<Run>,
