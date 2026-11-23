@@ -357,35 +357,6 @@ fn chat_row(state: &TeamsApp, chat: &ChatSummary) -> Element<'static, AppMessage
     } else {
         preview_row
     };
-    let chat_details = column![heading, preview_row]
-    .spacing(2)
-    .width(Fill);
-    let item = button(
-        row![
-            state.chat_avatar(chat, appearance::metrics::CHAT_AVATAR),
-            chat_details,
-        ]
-    .spacing(12)
-        .align_y(Alignment::Center),
-    )
-    .width(Fill)
-    .height(CHAT_ROW_HEIGHT)
-    .padding(iced::Padding { top: 8.0, right: 12.0, bottom: 8.0, left: 20.0 })
-    .on_press(AppMessage::SelectConversation(chat.id.clone()))
-    .style(ui_button(
-        if selected {
-            Tone::Selected
-        } else {
-            Tone::Transparent
-        },
-        if selected {
-            Tone::SelectedHover
-        } else {
-            Tone::Hover
-        },
-        Tone::Text,
-        7.0,
-    ));
     let accessibility_hint = if typing {
         let name = state
             .typing_indicators
@@ -405,7 +376,81 @@ fn chat_row(state: &TeamsApp, chat: &ChatSummary) -> Element<'static, AppMessage
     } else {
         format!("{}\n{}", chat.title, preview)
     };
-    hint(item, accessibility_hint).into()
+    let chat_details = column![heading, preview_row].spacing(2).width(Fill);
+    button(row![
+        sidebar_avatar(state, chat),
+        hint(chat_details, accessibility_hint),
+    ].spacing(12).align_y(Alignment::Center))
+        .width(Fill)
+        .height(CHAT_ROW_HEIGHT)
+        .padding(iced::Padding { top: 8.0, right: 12.0, bottom: 8.0, left: 20.0 })
+        .on_press(AppMessage::SelectConversation(chat.id.clone()))
+        .style(ui_button(
+            if selected { Tone::Selected } else { Tone::Transparent },
+            if selected { Tone::SelectedHover } else { Tone::Hover },
+            Tone::Text,
+            7.0,
+        ))
+        .into()
+}
+
+fn sidebar_avatar(state: &TeamsApp, chat: &ChatSummary) -> Element<'static, AppMessage> {
+    let avatar = state.chat_avatar(chat, appearance::metrics::CHAT_AVATAR);
+    if chat.is_group {
+        return avatar;
+    }
+    let Some(person_id) = state.chat_person_id(chat) else {
+        return avatar;
+    };
+    let name = chat.title.clone();
+    let chat_id = chat.id.clone();
+    let photo = state.avatars.photo(&person_id).cloned();
+    let presence = state.presence.contact(&person_id, Instant::now()).map(|observed| observed.value);
+    let details = state.global_people_results.iter().find(|person| person.id == person_id).cloned();
+    let preview = move || {
+        let picture: Element<'_, AppMessage> = if let Some(photo) = &photo {
+            iced::widget::image(photo.clone()).width(56).height(56)
+                .content_fit(iced::ContentFit::Cover).into()
+        } else {
+            crate::avatar(&name, 56.0)
+        };
+        let mut profile = column![text(name.clone()).size(17).font(semibold())].spacing(4).width(Fill);
+        if let Some(title) = details.as_ref().and_then(|person| person.job_title.as_ref()) {
+            profile = profile.push(text(title.clone()).size(13).style(ui_text(Tone::Secondary)));
+        }
+        if let Some(presence) = &presence {
+            profile = profile.push(text(presence.label()).size(13).style(ui_text(Tone::Secondary)));
+        }
+        let mut card = column![row![picture, profile].spacing(12).align_y(Alignment::Center)].spacing(12);
+        if let Some(email) = details.as_ref().map(|person| &person.email).filter(|email| !email.is_empty()) {
+            card = card.push(text(email.clone()).size(13).style(ui_text(Tone::Secondary)));
+        }
+        if let Some(note) = presence.as_ref().and_then(|presence| presence.status_note.as_ref()) {
+            card = card.push(text(note.message.clone()).size(13).style(ui_text(Tone::Secondary)));
+        }
+        card = card.push(button(row![icon_tone(Icon::Chat, Tone::Accent, 16.0), text(tr("Start chat")).size(13)]
+            .spacing(8).align_y(Alignment::Center))
+            .padding([8, 12])
+            .on_press(AppMessage::SelectConversation(chat_id.clone()))
+            .style(ui_button(Tone::Hover, Tone::SelectedHover, Tone::Text, 6.0)));
+        container(card).width(308).padding(16).style(|theme| container::Style {
+            shadow: iced::Shadow {
+                color: Color::BLACK.scale_alpha(0.34),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 14.0,
+            },
+            ..ui_surface(Tone::Surface, true, 8.0)(theme)
+        }).into()
+    };
+    message_actions::view(avatar, preview, None, message_actions::Config {
+        context: chat.id.clone(),
+        placement: message_actions::Placement::Avatar,
+        enabled: !(state.group_details_open || state.new_conversation_open || state.image_viewer.is_some()
+            || state.profile_menu_open || state.person_card.is_some() || state.app_menu.surface.is_some()),
+        force_visible: state.demo_mode && chat.id == "chat-ana"
+            && std::env::args().any(|arg| arg == "--avatar-card-demo"),
+        reaction_picker: false,
+    })
 }
 
 fn chat_preview_line(preview: &str, group: bool, unread: bool) -> Element<'static, AppMessage> {

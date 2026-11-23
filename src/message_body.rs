@@ -3145,8 +3145,21 @@ impl Builder<'_> {
             }
             "p" | "div" | "section" | "tr" => {
                 self.flush();
+                let start = self.document.blocks.len();
                 self.children(element, &style, depth);
                 self.flush();
+                // The editor serializes an intentional empty line as an empty
+                // paragraph. Teams also uses an empty block with a single br.
+                if matches!(name, "p" | "div") && self.document.blocks.len() == start
+                    && text_paragraph(&self.current)
+                    && element.children().all(|child| {
+                        child.value().as_text().is_some_and(|text| text.trim().is_empty())
+                            || ElementRef::wrap(child).is_some_and(|element| element.value().name() == "br")
+                    })
+                    && (name == "p" || element.child_elements().next().is_some())
+                {
+                    self.document.blocks.push(self.current.clone());
+                }
             }
             "td" | "th" => {
                 if !self.current.runs.is_empty() {
@@ -3691,7 +3704,7 @@ impl Document {
             builder.document.blocks.push(Block { media: Some(image), ..Default::default() });
             image_budget -= 1;
         }
-        (!builder.document.blocks.is_empty()).then_some(builder.document)
+        builder.document.blocks.iter().any(|block| !blank_line(block)).then_some(builder.document)
     }
     pub fn plain(value: &str) -> Self {
         let mut runs = vec![Run {
@@ -4838,12 +4851,15 @@ pub fn view_with_media(
     while index < document.blocks.len() {
         let block = &document.blocks[index];
         if index > 0 {
-            let gap = message_block_gap(&document.blocks[index - 1], block);
+            let gap = message_block_gap(&document.blocks[index - 1], block, mine);
             if gap > 0.0 {
                 content = content.push(space::vertical().height(gap));
             }
         }
-        if block.quote > 0 {
+        if blank_line(block) {
+            content = content.push(space::vertical().height(f32::from(prefs.message_size) * prefs.line_height()));
+            index += 1;
+        } else if block.quote > 0 {
             let end = quote_group_end(&document.blocks, index);
             content = content.push(render_quote(
                 &document.blocks[index..end],
@@ -4917,7 +4933,7 @@ fn is_list_item(block: &Block) -> bool {
     })
 }
 
-fn plain_single_line(block: &Block) -> bool {
+fn text_paragraph(block: &Block) -> bool {
     block.quote == 0
         && !block.pre
         && block.heading == 0
@@ -4925,6 +4941,14 @@ fn plain_single_line(block: &Block) -> bool {
         && block.media.is_none()
         && block.card.is_none()
         && block.table.is_none()
+}
+
+fn blank_line(block: &Block) -> bool {
+    text_paragraph(block) && block.runs.is_empty()
+}
+
+fn plain_single_line(block: &Block) -> bool {
+    text_paragraph(block)
         && block.runs.iter().all(|run| !run.text.contains('\n'))
         && block.runs.iter().any(|run| !run.text.trim().is_empty())
 }
@@ -4953,11 +4977,15 @@ fn contact_line(block: &Block) -> bool {
             || run.style.link.as_deref().is_some_and(|url| url.starts_with("mailto:")))
 }
 
-fn message_block_gap(previous: &Block, current: &Block) -> f32 {
+fn message_block_gap(previous: &Block, current: &Block, mine: bool) -> f32 {
     if previous.quote > 0 && current.quote > 0 {
         24.0
     } else if previous.quote > 0 {
         6.0
+    } else if blank_line(previous) || blank_line(current)
+        || mine && text_paragraph(previous) && text_paragraph(current)
+    {
+        0.0
     } else if contact_line(previous) && contact_line(current) {
         0.0
     } else if is_list_item(previous) && is_list_item(current) {
@@ -5957,6 +5985,24 @@ mod tests {
     }
 
     #[test]
+    fn sent_lines_stay_contiguous_and_keep_only_explicit_blanks() {
+        let text = "Review notes\nPlease check the link.\n• Task: EXAMPLE-1\n\nThanks!";
+        let document = Document::from_editor(text, &ComposerFormatting::default());
+        let received = Document::from_html(&document.to_html()).unwrap();
+        for document in [&document, &received] {
+            assert_eq!(visible_block_texts(document).join("\n"), text);
+            assert!(blank_line(&document.blocks[3]));
+            assert_eq!(document.blocks.iter().filter(|block| blank_line(block)).count(), 1);
+            for pair in document.blocks.windows(2) {
+                assert_eq!(message_block_gap(&pair[0], &pair[1], true), 0.0);
+            }
+        }
+        assert_eq!(message_block_gap(&received.blocks[0], &received.blocks[1], false), 12.0);
+        let div = Document::from_html("<div>Start</div><div><br></div><div>End</div>").unwrap();
+        assert_eq!(visible_block_texts(&div).join("\n"), "Start\n\nEnd");
+    }
+
+    #[test]
     fn only_a_card_with_message_text_uses_the_full_bubble() {
         let html = include_str!("../tests/fixtures/message-with-card.html");
         let document = Document::from_html(html).unwrap();
@@ -5979,7 +6025,7 @@ mod tests {
         };
         assert_eq!(greeting.runs.iter().filter(|run| run.style.mention).count(), 3);
         assert_eq!(plain_block(follow_up), "Poderiam conferir o alerta de teste, por favor?");
-        assert_eq!(message_block_gap(greeting, follow_up), 0.0);
+        assert_eq!(message_block_gap(greeting, follow_up, false), 0.0);
 
         let explicit_break = body.replace("</p>\n<p>Poderiam", "<br>Poderiam");
         let document = Document::from_html(&explicit_break).unwrap();
@@ -6013,8 +6059,8 @@ mod tests {
         let theme = Theme::Dark;
         let style = &doc.blocks[0].runs[0].style;
         assert_eq!(message_run_color(style, &theme, tone(&theme, Tone::Incoming), tone(&theme, Tone::Accent)), tone(&theme, Tone::Accent), "received links must not inherit white body text");
-        assert_eq!(message_block_gap(&doc.blocks[0], &doc.blocks[1]), 0.0, "consecutive email links form one contact block");
-        assert_eq!(message_block_gap(&doc.blocks[1], &doc.blocks[2]), 12.0);
+        assert_eq!(message_block_gap(&doc.blocks[0], &doc.blocks[1], false), 0.0, "consecutive email links form one contact block");
+        assert_eq!(message_block_gap(&doc.blocks[1], &doc.blocks[2], false), 12.0);
         let plain = Style { color: Some(0xe8825e), ..Style::default() };
         assert_eq!(message_run_color(&plain, &theme, tone(&theme, Tone::Incoming), tone(&theme, Tone::Text)), crate::appearance::rgb(0xe8825e));
     }
@@ -6062,12 +6108,12 @@ mod tests {
             "<blockquote><p>Segunda citação</p></blockquote>",
             "<p>Olá</p><p>Início</p><ul><li>Um</li><li>Dois</li></ul><p>Fim</p>"
         )).unwrap();
-        assert_eq!(message_block_gap(&doc.blocks[0], &doc.blocks[1]), 24.0);
-        assert_eq!(message_block_gap(&doc.blocks[1], &doc.blocks[2]), 6.0);
-        assert_eq!(message_block_gap(&doc.blocks[2], &doc.blocks[3]), 12.0);
-        assert_eq!(message_block_gap(&doc.blocks[3], &doc.blocks[4]), 18.0);
-        assert_eq!(message_block_gap(&doc.blocks[4], &doc.blocks[5]), 0.0);
-        assert_eq!(message_block_gap(&doc.blocks[5], &doc.blocks[6]), 12.0);
+        assert_eq!(message_block_gap(&doc.blocks[0], &doc.blocks[1], false), 24.0);
+        assert_eq!(message_block_gap(&doc.blocks[1], &doc.blocks[2], false), 6.0);
+        assert_eq!(message_block_gap(&doc.blocks[2], &doc.blocks[3], false), 12.0);
+        assert_eq!(message_block_gap(&doc.blocks[3], &doc.blocks[4], false), 18.0);
+        assert_eq!(message_block_gap(&doc.blocks[4], &doc.blocks[5], false), 0.0);
+        assert_eq!(message_block_gap(&doc.blocks[5], &doc.blocks[6], false), 12.0);
     }
 
     #[test]
@@ -6085,10 +6131,10 @@ mod tests {
         .unwrap();
         assert_eq!(doc.blocks.len(), 8);
         for pair in doc.blocks.windows(2) {
-            assert_eq!(message_block_gap(&pair[0], &pair[1]), 0.0);
+            assert_eq!(message_block_gap(&pair[0], &pair[1], false), 0.0);
         }
         let prose = Document::from_html("<p>Olá</p><p>Início do assunto.</p>").unwrap();
-        assert_eq!(message_block_gap(&prose.blocks[0], &prose.blocks[1]), 12.0);
+        assert_eq!(message_block_gap(&prose.blocks[0], &prose.blocks[1], false), 12.0);
     }
 
     #[test]

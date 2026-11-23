@@ -545,7 +545,6 @@ enum AppMessage {
     MessageTextPressed(String, usize, usize, f32, f32, Option<message_selection::Link>),
     MessageTextDragged(String, usize, usize),
     MessageTextReleased,
-    MessageCopied(String, Result<(), String>),
     PlainTextCopied(Result<(), String>),
     CapturePreview,
     PreviewCaptured(iced::window::Id, iced::window::Screenshot),
@@ -873,7 +872,6 @@ enum AppMessage {
     DeviceCodeStarted(Result<(auth::DeviceCodeFlow, auth::DeviceCodeInfo), String>),
     OpenDeviceLogin,
     CopyDeviceCode,
-    DeviceCodeCopied(Result<(), String>),
     BrowserAuthenticationComplete(Result<auth::BrowserSignInOutcome, String>),
     AuthenticationComplete(Result<TeamsSession, String>),
     ChatsLoaded(Result<LoadedChats, String>),
@@ -2072,7 +2070,6 @@ struct MeetNowState {
     meeting: Option<calendar_transport::InstantMeeting>,
     start_after_create: bool,
     error: Option<String>,
-    copied: bool,
 }
 
 struct TeamsApp {
@@ -2258,7 +2255,6 @@ struct TeamsApp {
     demo_mode: bool,
     client_id: String,
     device_code: Option<auth::DeviceCodeInfo>,
-    device_code_copied: bool,
     session: Option<TeamsSession>,
     user_id: String,
     user_name: String,
@@ -2284,7 +2280,6 @@ struct TeamsApp {
     message_text_click: Option<(String, f32, f32, std::time::Instant)>,
     message_text_link: Option<message_selection::Link>,
     message_menu_for: Option<String>,
-    message_copy_feedback: Option<String>,
     editing_message_id: Option<String>,
     editing_message_text: String,
     editing_message_content: text_editor::Content,
@@ -5391,7 +5386,6 @@ impl TeamsApp {
             demo_mode,
             client_id,
             device_code: None,
-            device_code_copied: false,
             session: None,
             user_id: String::new(),
             user_name: String::new(),
@@ -5417,7 +5411,6 @@ impl TeamsApp {
             message_text_click: None,
             message_text_link: None,
             message_menu_for: None,
-            message_copy_feedback: None,
             editing_message_id: None,
             editing_message_text: String::new(),
             editing_message_content: text_editor::Content::new(),
@@ -6481,12 +6474,7 @@ impl TeamsApp {
                             .style(text_style(rgb(0x616161))),
                         row![
                             button(
-                                text(if self.device_code_copied {
-                                    tr("Code copied")
-                                } else {
-                                    tr("Copy code")
-                                })
-                                .size(13),
+                                text(tr("Copy code")).size(13),
                             )
                             .padding([8, 12])
                             .on_press(AppMessage::CopyDeviceCode)
@@ -6749,10 +6737,6 @@ impl TeamsApp {
             || self.reaction_participants_for.as_deref() == Some(message.id.as_str())
             || self.delete_confirmation_for.as_deref() == Some(message.id.as_str());
         let content: Element<'_, AppMessage> = if showing_details { details.into() } else { actions.into() };
-        let mut content = column![content].spacing(6);
-        if let Some(feedback) = self.message_copy_feedback.as_deref() {
-            content = content.push(container(text(feedback.to_owned()).size(12).style(ui_text(Tone::Secondary))).padding([4, 10]));
-        }
         container(scrollable(content).direction(scroll_axis()).height(iced::Length::Shrink).style(ui_scroll))
             .width(252).max_height(370).padding(6).style(message_popup_style).into()
     }
@@ -7414,7 +7398,7 @@ impl TeamsApp {
                 popup,
                 message_actions::Config {
                     context: format!("{}:{}", self.draft_key().unwrap_or_default(), message.id),
-                    outgoing: message.is_mine,
+                    placement: message_actions::Placement::Message { outgoing: message.is_mine },
                     enabled: interactive,
                     force_visible: demo_hover,
                     reaction_picker: self.reaction_picker_for.as_deref() == Some(message.id.as_str()),
@@ -10695,13 +10679,6 @@ fn selected_visible_text(state: &TeamsApp) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn copy_message_to_clipboard(payload: message_body::ClipboardPayload) -> Result<(), String> {
-    if payload.text.trim().is_empty() {
-        return Err(tr("This message has no text to copy.").to_owned());
-    }
-    copy_plain_text(&payload.text)
-}
-
 fn update(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
     if !live_trace::enabled() { return update_impl(state, message); }
     let phase = live_trace::update_phase(&message);
@@ -11971,7 +11948,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 state.pending_history_anchor = None;
                 state.follow_tail = false;
                 state.message_menu_for = None;
-                state.message_copy_feedback = None;
                 state.status.clear();
                 return reveal_history_message(state, index);
             }
@@ -11994,7 +11970,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 pages_remaining: REPLY_ORIGIN_PAGE_BUDGET,
             });
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             match advance_reply_origin_navigation(state) {
                 ReplyOriginNavigationProgress::Found(task)
                 | ReplyOriginNavigationProgress::Loading(task) => task,
@@ -12044,7 +12019,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.conversation_search_feedback = None;
             state.selected_message = None;
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             if state.message_search_open {
                 iced::widget::operation::focus("message-search")
             } else {
@@ -12068,7 +12042,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 state.conversation_search_feedback = None;
                 state.selected_message = None;
                 state.message_menu_for = None;
-                state.message_copy_feedback = None;
             }
             state.pending_reply_origin_navigation = None;
             iced::widget::operation::focus("message-search")
@@ -12182,7 +12155,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             };
             state.selected_message = Some(messages[index].id.clone());
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             scroll_target.map_or_else(Task::none, |target| {
                 iced::widget::operation::scroll_to::<AppMessage>(
                     "message-history",
@@ -12208,10 +12180,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::CopySelectedMessage => {
             if let Some(text) = selected_visible_text(state) {
-                return Task::perform(
-                    async move { copy_plain_text(&text) },
-                    AppMessage::PlainTextCopied,
-                );
+                return update_inner(state, AppMessage::CopyPlainText(text));
             }
             if let Some(message_id) = state.selected_message.clone() {
                 return update_inner(state, AppMessage::CopyMessage(message_id));
@@ -12300,7 +12269,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 state.delete_confirmation_for = None;
             }
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             state.reaction_picker_for = None;
             state.reaction_participants_for = None;
             Task::none()
@@ -12312,21 +12280,14 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 .find(|message| message.id == message_id)
             else {
                 state.message_menu_for = None;
-                state.message_copy_feedback = None;
                 return Task::none();
             };
             let payload = message_body::clipboard_payload(message.rich.as_deref(), &message.body);
             if payload.text.trim().is_empty() {
-                let feedback = tr("This message has no text to copy.").to_owned();
-                state.status = feedback.clone();
-                state.message_copy_feedback = Some(feedback);
+                state.status = tr("This message has no text to copy.").into();
                 return Task::none();
             }
-            state.message_copy_feedback = Some(tr("Copying message…").into());
-            Task::perform(
-                async move { copy_message_to_clipboard(payload) },
-                move |result| AppMessage::MessageCopied(message_id, result),
-            )
+            update_inner(state, AppMessage::CopyPlainText(payload.text))
         }
         AppMessage::CopyPlainText(value) => {
             if value.is_empty() {
@@ -12344,19 +12305,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             update_inner(state, AppMessage::CopyPlainText(selected))
         }
         AppMessage::PlainTextCopied(result) => {
-            state.status = match result {
-                Ok(()) => tr("Text copied.").into(),
-                Err(error) => error,
-            };
-            Task::none()
-        }
-        AppMessage::MessageCopied(message_id, result) => {
-            let feedback = result
-                .map(|()| tr("Message copied.").to_owned())
-                .unwrap_or_else(|error| error);
-            state.status = feedback.clone();
-            if state.message_menu_for.as_deref() == Some(message_id.as_str()) {
-                state.message_copy_feedback = Some(feedback);
+            if let Err(error) = result {
+                state.status = error;
             }
             Task::none()
         }
@@ -14659,7 +14609,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.meet_now.busy = true;
             state.meet_now.start_after_create = start;
             state.meet_now.error = None;
-            state.meet_now.copied = false;
             state.meet_now.sequence = state.meet_now.sequence.wrapping_add(1);
             let (epoch, sequence) = (state.session_epoch, state.meet_now.sequence);
             if state.demo_mode {
@@ -14699,10 +14648,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::MeetNowCopied(epoch, sequence, result) => {
             if epoch == state.session_epoch && sequence == state.meet_now.sequence {
-                match result {
-                    Ok(()) => { state.meet_now.copied = true; state.meet_now.error = None; }
-                    Err(error) => state.meet_now.error = Some(error),
-                }
+                state.meet_now.error = result.err();
             }
             Task::none()
         }
@@ -15386,7 +15332,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.message_text_click = None;
             state.message_text_link = None;
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             state.editing_message_id = None;
             state.editing_message_text.clear();
             state.delete_confirmation_for = None;
@@ -15528,7 +15473,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.message_text_click = None;
             state.message_text_link = None;
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             state.editing_message_id = None;
             state.editing_message_text.clear();
             state.delete_confirmation_for = None;
@@ -16770,7 +16714,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             }
 
             state.device_code = None;
-            state.device_code_copied = false;
             state.status.clear();
             state.signing_in = true;
             let config = auth::AuthConfig::work(client_id);
@@ -16813,7 +16756,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::DeviceCodeStarted(Ok((flow, info))) => {
             state.status.clear();
-            state.device_code_copied = false;
             state.device_code = Some(info.clone());
             let _ = webbrowser::open(&info.browser_url);
             Task::perform(
@@ -16840,15 +16782,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             };
             Task::perform(
                 background::run(move || copy_plain_text(&code)),
-                AppMessage::DeviceCodeCopied,
+                AppMessage::PlainTextCopied,
             )
-        }
-        AppMessage::DeviceCodeCopied(result) => {
-            match result {
-                Ok(()) => state.device_code_copied = true,
-                Err(error) => state.status = error,
-            }
-            Task::none()
         }
         AppMessage::AuthenticationComplete(Ok(session)) => {
             state.stop_trouter();
@@ -17049,7 +16984,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.message_text_click = None;
             state.message_text_link = None;
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             state.remember_draft();
             if state.demo_mode {
                 state.selected_team = Some(team_id.clone());
@@ -17177,7 +17111,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.message_text_click = None;
             state.message_text_link = None;
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             state.show_conversation_list = false;
             state.remember_draft();
             if state.demo_mode {
@@ -18225,7 +18158,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.collapsed_channel_threads.clear();
             state.selected_message = None;
             state.message_menu_for = None;
-            state.message_copy_feedback = None;
             state.editing_message_id = None;
             state.editing_message_text.clear();
             state.delete_confirmation_for = None;
@@ -23008,7 +22940,7 @@ mod tests {
     }
 
     #[test]
-    fn message_menu_tracks_selection_feedback_and_conversation_changes() {
+    fn message_menu_tracks_selection_and_copies_silently() {
         let mut state = TeamsApp::from_client_id(String::new());
         let id = "fixture-message-1".to_owned();
         let next_id = "fixture-message-2".to_owned();
@@ -23035,30 +22967,22 @@ mod tests {
         assert_eq!(state.selected_message.as_deref(), Some(next_id.as_str()));
         assert_eq!(state.message_menu_for.as_deref(), Some(next_id.as_str()));
 
-        let _ = update(
-            &mut state,
-            AppMessage::MessageCopied(next_id, Err("Clipboard indisponível".into())),
-        );
-        assert_eq!(
-            state.message_copy_feedback.as_deref(),
-            Some("Clipboard indisponível")
-        );
-        assert_eq!(state.status, "Clipboard indisponível");
+        state.status = "Previous status".into();
+        drop(update(&mut state, AppMessage::CopySelectedMessage));
+        assert_eq!(state.status, "Previous status");
+        drop(update(&mut state, AppMessage::PlainTextCopied(Ok(()))));
+        assert_eq!(state.status, "Previous status");
+        drop(update(&mut state, AppMessage::PlainTextCopied(Err("Clipboard unavailable".into()))));
+        assert_eq!(state.status, "Clipboard unavailable");
 
-        let _ = update(&mut state, AppMessage::CloseMessageMenu);
+        drop(update(&mut state, AppMessage::CloseMessageMenu));
         assert!(state.message_menu_for.is_none());
-        let _ = update(&mut state, AppMessage::CopySelectedMessage);
-        assert_eq!(
-            state.message_copy_feedback.as_deref(),
-            Some("Copying message…")
-        );
 
         let _ = update(
             &mut state,
             AppMessage::SelectConversation("chat-mariana".into()),
         );
         assert!(state.message_menu_for.is_none());
-        assert!(state.message_copy_feedback.is_none());
     }
 
     #[test]

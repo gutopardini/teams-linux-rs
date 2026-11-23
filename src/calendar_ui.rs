@@ -336,7 +336,7 @@ fn meet_now_panel(state: &crate::MeetNowState) -> Element<'static, AppMessage> {
     if state.meeting.is_some() {
         content = content.push(text(tr("Link ready to share")).size(13).style(ui_text(Tone::Secondary)))
             .push(row![
-                button(row![icon_tone(Icon::Copy,Tone::Text,16.0),text(if state.copied {tr("Link copied")} else {tr("Copy link")}).size(13)].spacing(7).align_y(Alignment::Center))
+                button(row![icon_tone(Icon::Copy,Tone::Text,16.0),text(tr("Copy link")).size(13)].spacing(7).align_y(Alignment::Center))
                     .padding([8,10]).on_press(AppMessage::MeetNowCopy).style(ui_button(Tone::Hover,Tone::SelectedHover,Tone::Text,4.0)),
                 button(text(tr("Start meeting")).size(13).font(semibold())).padding([8,12])
                     .on_press(AppMessage::MeetNowCreate(true)).style(ui_button(Tone::Primary,Tone::SelectedHover,Tone::OnPrimary,4.0)),

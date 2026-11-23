@@ -5,10 +5,19 @@ use iced::advanced::{
     widget::{Operation, Tree, tree},
 };
 use iced::{Element, Event, Length, Point, Rectangle, Size, Theme, Vector};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    Message { outgoing: bool },
+    Avatar,
+}
+
+const PROFILE_HOVER_DELAY: Duration = Duration::from_millis(350);
 
 pub struct Config {
     pub context: String,
-    pub outgoing: bool,
+    pub placement: Placement,
     pub enabled: bool,
     pub force_visible: bool,
     pub reaction_picker: bool,
@@ -26,7 +35,7 @@ pub fn view<'a>(
         toolbar: None,
         popup,
         context: config.context,
-        outgoing: config.outgoing,
+        placement: config.placement,
         enabled: config.enabled,
         force_visible: config.force_visible,
         reaction_picker: config.reaction_picker,
@@ -39,7 +48,7 @@ struct Actions<'a, R: renderer::Renderer = iced::Renderer> {
     toolbar: Option<Element<'a, AppMessage, Theme, R>>,
     popup: Option<Element<'a, AppMessage, Theme, R>>,
     context: String,
-    outgoing: bool,
+    placement: Placement,
     enabled: bool,
     force_visible: bool,
     reaction_picker: bool,
@@ -49,6 +58,7 @@ struct Actions<'a, R: renderer::Renderer = iced::Renderer> {
 struct State {
     context: String,
     hovered: bool,
+    hover_started: Option<Instant>,
     scroll_suppressed: bool,
     visible: bool,
 }
@@ -63,6 +73,20 @@ fn toolbar_bounds(anchor: Rectangle, size: Size, viewport: Rectangle, outgoing: 
         width: size.width,
         height: size.height,
     }
+}
+
+fn profile_bounds(anchor: Rectangle, size: Size, viewport: Rectangle) -> Rectangle {
+    let top = anchor.y - size.height;
+    let bottom = anchor.y + anchor.height;
+    let y = if top >= viewport.y + 4.0 || viewport.height - bottom < anchor.y {
+        top
+    } else {
+        bottom
+    };
+    Rectangle::new(Point::new(
+        anchor.x.clamp(4.0, (viewport.width - size.width - 4.0).max(4.0)),
+        y.clamp(4.0, (viewport.height - size.height - 4.0).max(4.0)),
+    ), size)
 }
 
 fn popup_bounds(toolbar: Rectangle, size: Size, viewport: Rectangle, prefer_above: bool) -> Rectangle {
@@ -144,17 +168,31 @@ impl<R: renderer::Renderer> Widget<AppMessage, Theme, R> for Actions<'_, R> {
         // An unavailable cursor may mean the toolbar above us owns it. The
         // overlay updates hover across both rectangles, including that handoff.
         if matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. })) {
+            state.hover_started = None;
             state.scroll_suppressed = true;
             set_hover(&mut state.hovered, false, shell);
         } else if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. })) {
             state.scroll_suppressed = false;
             if let Some(position) = cursor.position() {
-                set_hover(&mut state.hovered, self.enabled && layout.bounds().contains(position) && viewport.contains(position), shell);
+                let over = self.enabled && layout.bounds().contains(position) && viewport.contains(position);
+                if self.placement == Placement::Avatar && over && !state.hovered {
+                    let started = *state.hover_started.get_or_insert_with(Instant::now);
+                    shell.request_redraw_at(started + PROFILE_HOVER_DELAY);
+                } else {
+                    state.hover_started = None;
+                    set_hover(&mut state.hovered, over, shell);
+                }
             }
+        } else if let Event::Window(iced::window::Event::RedrawRequested(now)) = event
+            && state.hover_started.is_some_and(|started| now.saturating_duration_since(started) >= PROFILE_HOVER_DELAY)
+        {
+            state.hover_started = None;
+            set_hover(&mut state.hovered, cursor.is_over(layout.bounds()) && cursor.is_over(*viewport), shell);
         } else if matches!(event, Event::Keyboard(iced::keyboard::Event::KeyPressed { .. })) {
             state.scroll_suppressed = false;
         }
         if matches!(event, Event::Window(iced::window::Event::Unfocused) | Event::Mouse(mouse::Event::CursorLeft)) {
+            state.hover_started = None;
             set_hover(&mut state.hovered, false, shell);
         }
         self.base.as_widget_mut().update(
@@ -181,7 +219,7 @@ impl<R: renderer::Renderer> Widget<AppMessage, Theme, R> for Actions<'_, R> {
         let (base_tree, rest) = tree.children.split_first_mut()?;
         let (toolbar_tree, popup_trees) = rest.split_first_mut()?;
         let mut layers = Vec::new();
-        if let Some(base) = self.base.as_widget_mut().overlay(
+        if self.placement != Placement::Avatar && let Some(base) = self.base.as_widget_mut().overlay(
             base_tree, layout.children().next().unwrap(), renderer, viewport, translation,
         ) { layers.push(base); }
         let visible = self.enabled && (!state.scroll_suppressed || self.popup.is_some())
@@ -206,7 +244,7 @@ impl<R: renderer::Renderer> Widget<AppMessage, Theme, R> for Actions<'_, R> {
                 scroll_suppressed: &mut state.scroll_suppressed,
                 anchor: layout.bounds() + translation,
                 viewport: *viewport,
-                outgoing: self.outgoing,
+                placement: self.placement,
                 reaction_picker: self.reaction_picker,
             })));
         }
@@ -222,18 +260,26 @@ struct ActionsOverlay<'a, 'b, R: renderer::Renderer> {
     scroll_suppressed: &'a mut bool,
     anchor: Rectangle,
     viewport: Rectangle,
-    outgoing: bool,
+    placement: Placement,
     reaction_picker: bool,
 }
 
 impl<R: renderer::Renderer> overlay::Overlay<AppMessage, Theme, R> for ActionsOverlay<'_, '_, R> {
     fn layout(&mut self, renderer: &R, bounds: Size) -> layout::Node {
-        let viewport = self.viewport.intersection(&Rectangle::with_size(bounds)).unwrap_or_default();
+        let window = Rectangle::with_size(bounds);
+        let viewport = if self.placement == Placement::Avatar {
+            window
+        } else {
+            self.viewport.intersection(&window).unwrap_or_default()
+        };
         let available = Size::new((viewport.width - 8.0).max(1.0), (viewport.height - 8.0).max(1.0));
         let mut toolbar = self.toolbar.as_widget_mut().layout(
             self.toolbar_tree, renderer, &layout::Limits::new(Size::ZERO, available),
         );
-        let toolbar_rect = toolbar_bounds(self.anchor, toolbar.size(), viewport, self.outgoing);
+        let toolbar_rect = match self.placement {
+            Placement::Message { outgoing } => toolbar_bounds(self.anchor, toolbar.size(), viewport, outgoing),
+            Placement::Avatar => profile_bounds(self.anchor, toolbar.size(), viewport),
+        };
         toolbar.move_to_mut(Point::new(toolbar_rect.x, toolbar_rect.y));
         let mut children = vec![toolbar];
         if let Some((popup, tree)) = &mut self.popup {
@@ -296,6 +342,11 @@ impl<R: renderer::Renderer> overlay::Overlay<AppMessage, Theme, R> for ActionsOv
             if shell.is_event_captured() { return; }
         }
         if toolbar_uncovered(layout) { self.toolbar.as_widget_mut().update(self.toolbar_tree, event, toolbar, cursor, renderer, clipboard, shell, &layout.bounds()); }
+        if self.placement == Placement::Avatar && shell.is_event_captured()
+            && matches!(event, Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)))
+        {
+            set_hover(self.hovered, false, shell);
+        }
         if (on_toolbar || on_popup) && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
             shell.capture_event();
         }
@@ -369,7 +420,7 @@ mod tests {
             popup: popup.then(|| button(Space::new().width(140).height(90)).padding(0)
                 .on_press(AppMessage::CopyMessage("target".into())).into()),
             context: "chat:a:target".into(),
-            outgoing: false,
+            placement: Placement::Message { outgoing: false },
             reaction_picker: false,
             enabled: true,
             force_visible: false,
@@ -399,6 +450,27 @@ mod tests {
             &mut iced::advanced::clipboard::Null, &mut shell);
         let captured = shell.is_event_captured();
         (messages, captured)
+    }
+
+    #[test]
+    fn avatar_card_waits_then_stays_open_across_the_avatar_and_card() {
+        let (mut widget, mut tree, node) = fixture(false);
+        widget.placement = Placement::Avatar;
+        let position = Point::new(120.0, 160.0);
+        update_base(&mut widget, &mut tree, &node, position);
+        assert!(widget.overlay(&mut tree, Layout::new(&node), &(), &VIEWPORT, Vector::ZERO).is_none());
+
+        let started = tree.state.downcast_ref::<State>().hover_started.unwrap();
+        widget.update(&mut tree, &Event::Window(iced::window::Event::RedrawRequested(started + PROFILE_HOVER_DELAY)),
+            Layout::new(&node), mouse::Cursor::Available(position), &(), &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(&mut Vec::new()), &VIEWPORT);
+
+        let card = Point::new(120.0, 125.0);
+        update_overlay(&mut widget, &mut tree, &node, card, Event::Mouse(mouse::Event::CursorMoved { position: card }));
+        assert!(tree.state.downcast_ref::<State>().hovered);
+        let outside = Point::new(480.0, 380.0);
+        update_overlay(&mut widget, &mut tree, &node, outside, Event::Mouse(mouse::Event::CursorMoved { position: outside }));
+        assert!(widget.overlay(&mut tree, Layout::new(&node), &(), &VIEWPORT, Vector::ZERO).is_none());
     }
 
     #[test]
