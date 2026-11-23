@@ -5776,7 +5776,7 @@ pub fn inline_image_view(
     );
     let preview: Element<'static, AppMessage> = if let Some(loaded) = cached {
         let open = button(
-            image(loaded.handle.clone())
+            image(loaded.frame_at(std::time::Instant::now()).clone())
                 .width(width)
                 .height(height)
                 .content_fit(iced::ContentFit::Contain),

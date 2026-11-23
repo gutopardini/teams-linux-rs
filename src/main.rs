@@ -858,6 +858,7 @@ enum AppMessage {
     CancelQueuedInlineImage(String),
     RetryInlineImage(String),
     InlineImageLoaded(u64, String, Result<images::LoadedImage, String>),
+    GifAnimationTick,
     DismissIncomingCall(String),
     OpenInlineImage(String),
     CloseImageViewer,
@@ -2105,6 +2106,7 @@ struct MeetNowState {
 struct TeamsApp {
     resizing_sidebar: bool,
     chat_render_revision: u64,
+    gif_frame_revision: u64,
     chat_list_revision: u64,
     /// Messages already drawn in the cached history. Newer ones render as a
     /// tail so Enter does not rebuild the whole conversation.
@@ -5283,6 +5285,7 @@ impl TeamsApp {
         let mut app = Self {
             resizing_sidebar: false,
             chat_render_revision: 0,
+            gif_frame_revision: 0,
             chat_list_revision: 0,
             shown_chat_history: 0,
             shown_channel_history: 0,
@@ -5822,6 +5825,7 @@ impl TeamsApp {
             self.media.complete(thumbnail_url.into(), Some(images::LoadedImage {
                 handle: sample.preview, width: sample.width, height: sample.height,
                 estimated_bytes: sample.preview_bytes,
+                animation: None,
             }));
             self.messages.push(GraphMessage {
                 id: "demo-file-caption".into(),
@@ -5847,6 +5851,7 @@ impl TeamsApp {
             self.media.complete(inline.url.clone(), Some(images::LoadedImage {
                 handle: picture.preview.clone(), width: picture.width, height: picture.height,
                 estimated_bytes: picture.preview_bytes,
+                animation: None,
             }));
             self.messages.push(GraphMessage {
                 id: "demo-image-message".into(), author: "Ana Paula".into(),
@@ -5988,6 +5993,7 @@ impl TeamsApp {
             self.media.complete(preview_url.into(), Some(images::LoadedImage {
                 handle: picture.preview.clone(), width: picture.width, height: picture.height,
                 estimated_bytes: picture.preview_bytes,
+                animation: None,
             }));
             let file = ost::api::ChatFileRef {
                 preview: Some(ost::api::ChatFilePreview {url: preview_url.into(), width: 500, height: 300}),
@@ -8280,7 +8286,7 @@ impl TeamsApp {
         let (stable, pending) = messages.split_at(shown);
         let anchor = stable.last().cloned();
         let cached = iced::widget::lazy(
-            (self.chat_render_revision, width.to_bits(), compact, loading, selected_chat_hidden),
+            (self.chat_render_revision, self.gif_frame_revision, width.to_bits(), compact, loading, selected_chat_hidden),
             move |_| {
                 self.history_view(
                     stable,
@@ -10268,6 +10274,13 @@ fn typing_dots_pulse() -> impl iced::futures::Stream<Item = AppMessage> {
     })
 }
 
+fn gif_animation_ticks() -> impl iced::futures::Stream<Item = AppMessage> {
+    iced::futures::stream::unfold((), |()| async {
+        futures_timer::Delay::new(Duration::from_millis(40)).await;
+        Some((AppMessage::GifAnimationTick, ()))
+    })
+}
+
 fn sync_ticks() -> impl iced::futures::Stream<Item = AppMessage> {
     iced::futures::stream::unfold((), |()| async {
         futures_timer::Delay::new(std::time::Duration::from_secs(5)).await;
@@ -10434,6 +10447,14 @@ fn subscription(state: &TeamsApp) -> iced::Subscription<AppMessage> {
     }
     if state.typing_indicators.any_active(Instant::now()) {
         subscriptions.push(iced::Subscription::run(typing_dots_pulse));
+    }
+    let visible_gif_is_animated = state.section == Section::Chats
+        && state.active_conversation_surface() == ConversationSurface::Chat
+        && state.messages.iter().any(|message| {
+            message.images.iter().any(|image| state.media.is_animated(&image.url))
+        });
+    if visible_gif_is_animated {
+        subscriptions.push(iced::Subscription::run(gif_animation_ticks));
     }
     if state.call_window.is_some()
         || (state.section == Section::Chats
@@ -10867,6 +10888,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
     // Everything else conservatively invalidates it, including all asynchronous
     // message/photo/presence completions, scrolling, menus and preferences.
     let typing_pulse = matches!(&message, AppMessage::TypingPulse);
+    let gif_animation_tick = matches!(&message, AppMessage::GifAnimationTick);
     let meeting_clock = matches!(&message, AppMessage::MeetingClock);
     let send_started = matches!(&message, AppMessage::SendMessage | AppMessage::ComposerSettled);
     let composer_only = matches!(&message,
@@ -10897,7 +10919,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
     let list_viewport = matches!(&message, AppMessage::ChatListScrolled(..) | AppMessage::HistoryScrolled(_));
     // The pulse only animates dots already built into the header. Bumping the
     // sidebar key here rebuilt every conversation row several times a second.
-    if !composer_only && !history_refresh && !list_viewport && !typing_pulse && !meeting_clock && !send_started {
+    if !composer_only && !history_refresh && !list_viewport && !typing_pulse && !gif_animation_tick && !meeting_clock && !send_started {
         state.chat_render_revision = state.chat_render_revision.wrapping_add(1);
         state.chat_list_revision = state.chat_list_revision.wrapping_add(1);
     }
@@ -10906,7 +10928,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
     } else {
         Task::none()
     };
-    let skip_avatar_refresh = composer_only || matches!(
+    let skip_avatar_refresh = composer_only || gif_animation_tick || matches!(
         &message,
         AppMessage::MeetingCameraTick | AppMessage::DraftChanged(_)
             | AppMessage::DraftAction(_)
@@ -13070,6 +13092,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                                     width: picture.width,
                                     height: picture.height,
                                     estimated_bytes: picture.preview_bytes,
+                                    animation: None,
                                 }),
                             );
                         }
@@ -18252,6 +18275,10 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         AppMessage::TypingPulse => {
             state.typing_pulse = state.typing_pulse.wrapping_add(1);
             state.typing_indicators.prune_expired(Instant::now());
+            Task::none()
+        }
+        AppMessage::GifAnimationTick => {
+            state.gif_frame_revision = state.gif_frame_revision.wrapping_add(1);
             Task::none()
         }
         AppMessage::MessageSent(chat_id, Ok((session, message))) => {

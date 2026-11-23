@@ -16,6 +16,8 @@ const MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CLIPBOARD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 64;
+const MAX_GIF_FRAMES: usize = 90;
+const MAX_GIF_FRAME_BYTES: usize = 24 * 1024 * 1024;
 pub const MAX_IMAGES: usize = 8;
 pub const INLINE_MAX_WIDTH: f32 = 400.0;
 pub const INLINE_MAX_HEIGHT: f32 = 640.0;
@@ -35,6 +37,45 @@ pub struct LoadedImage {
     pub width: u32,
     pub height: u32,
     pub estimated_bytes: usize,
+    pub animation: Option<Arc<GifAnimation>>,
+}
+
+#[derive(Clone)]
+pub struct GifFrame {
+    handle: Handle,
+    delay: Duration,
+}
+
+#[derive(Clone)]
+pub struct GifAnimation {
+    frames: Vec<GifFrame>,
+    duration: Duration,
+    started_at: Instant,
+}
+
+impl GifAnimation {
+    fn frame(&self, now: Instant) -> &Handle {
+        let duration_ms = self.duration.as_millis().max(1);
+        let mut elapsed_ms = now.saturating_duration_since(self.started_at).as_millis() % duration_ms;
+        for frame in &self.frames {
+            let delay_ms = frame.delay.as_millis().max(1);
+            if elapsed_ms < delay_ms {
+                return &frame.handle;
+            }
+            elapsed_ms -= delay_ms;
+        }
+        &self.frames[0].handle
+    }
+}
+
+impl LoadedImage {
+    pub fn frame_at(&self, now: Instant) -> &Handle {
+        self.animation.as_ref().map_or(&self.handle, |animation| animation.frame(now))
+    }
+
+    pub fn is_animated(&self) -> bool {
+        self.animation.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -801,7 +842,9 @@ fn check_dimensions(width: u32, height: u32) -> Result<(), String> {
     }
 }
 
-fn decoded_preview(bytes: &[u8]) -> Result<(Handle, u32, u32, usize), String> {
+fn decoded_preview(
+    bytes: &[u8],
+) -> Result<(Handle, u32, u32, usize, Option<Arc<GifAnimation>>), String> {
     if bytes.len() > MAX_BYTES {
         return Err("A imagem ultrapassa o limite de 32 MB.".into());
     }
@@ -814,6 +857,15 @@ fn decoded_preview(bytes: &[u8]) -> Result<(Handle, u32, u32, usize), String> {
         .into_dimensions()
         .map_err(|_| "Não foi possível ler a imagem.".to_owned())?;
     check_dimensions(width, height)?;
+    if let Some(animation) = decode_gif_animation(bytes) {
+        let first = animation.frames.first().expect("animated GIF has a frame");
+        let handle = first.handle.clone();
+        let pixels = animation.frames.iter().map(|frame| match &frame.handle {
+            Handle::Rgba { pixels, .. } => pixels.len(),
+            _ => 0,
+        }).sum();
+        return Ok((handle, width, height, pixels, Some(Arc::new(animation))));
+    }
     let mut reader = reader()?;
     let mut limits = image_codec::Limits::default();
     limits.max_alloc = Some(256 * 1024 * 1024);
@@ -831,7 +883,48 @@ fn decoded_preview(bytes: &[u8]) -> Result<(Handle, u32, u32, usize), String> {
         width,
         height,
         estimated_bytes,
+        None,
     ))
+}
+
+fn decode_gif_animation(bytes: &[u8]) -> Option<GifAnimation> {
+    use image_codec::{AnimationDecoder, ImageDecoder};
+
+    let mut decoder = image_codec::codecs::gif::GifDecoder::new(Cursor::new(bytes)).ok()?;
+    let (width, height) = decoder.dimensions();
+    check_dimensions(width, height).ok()?;
+    let mut limits = image_codec::Limits::default();
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    decoder.set_limits(limits).ok()?;
+
+    let mut frames = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut duration = Duration::ZERO;
+    for result in decoder.into_frames().take(MAX_GIF_FRAMES) {
+        let frame = result.ok()?;
+        let (numerator, denominator) = frame.delay().numer_denom_ms();
+        let delay = Duration::from_millis(
+            if denominator == 0 { 100 } else { numerator / denominator }.clamp(20, 1_000) as u64,
+        );
+        let pixels = preview_bitmap(image_codec::DynamicImage::ImageRgba8(frame.into_buffer()));
+        let bytes = pixels.as_raw().len();
+        if total_bytes.saturating_add(bytes) > MAX_GIF_FRAME_BYTES {
+            break;
+        }
+        total_bytes += bytes;
+        duration = duration.saturating_add(delay);
+        frames.push(GifFrame {
+            handle: Handle::from_rgba(pixels.width(), pixels.height(), pixels.into_raw()),
+            delay,
+        });
+    }
+    (frames.len() > 1).then_some(GifAnimation {
+        frames,
+        duration,
+        started_at: Instant::now(),
+    })
 }
 
 fn decoded_original_pixels(bytes: &[u8]) -> Result<image_codec::RgbaImage, String> {
@@ -973,7 +1066,7 @@ pub fn stage_png(png: Vec<u8>) -> Result<StagedImage, String> {
     if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err("A captura não contém um PNG válido.".into());
     }
-    let (preview, width, height, preview_bytes) = decoded_preview(&png)?;
+    let (preview, width, height, preview_bytes, _) = decoded_preview(&png)?;
     Ok(staged_image(png, preview, width, height, preview_bytes))
 }
 
@@ -1563,11 +1656,12 @@ fn upload(base: &str, token: &str, chat_id: &str, picture: &mut StagedImage) -> 
 
 pub fn download(session: TeamsSession, url: &str) -> Result<LoadedImage, String> {
     let bytes = download_bytes(session, url)?;
-    decoded_preview(&bytes).map(|(handle, width, height, estimated_bytes)| LoadedImage {
+    decoded_preview(&bytes).map(|(handle, width, height, estimated_bytes, animation)| LoadedImage {
         handle,
         width,
         height,
         estimated_bytes,
+        animation,
     })
 }
 
@@ -1842,6 +1936,10 @@ impl MediaCache {
             .and_then(|(handle, _, _)| handle.as_ref())
     }
 
+    pub fn is_animated(&self, url: &str) -> bool {
+        self.get(url).is_some_and(LoadedImage::is_animated)
+    }
+
     pub fn estimated_bytes(&self) -> usize {
         self.cached_bytes
     }
@@ -2037,6 +2135,7 @@ mod tests {
             width: 1,
             height: 1,
             estimated_bytes,
+            animation: None,
         }
     }
 
