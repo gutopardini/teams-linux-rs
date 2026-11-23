@@ -61,7 +61,7 @@ fn edit_workload(count: usize, rich: bool) -> Value {
         state.composer_content.move_to(message_body::editor_cursor_at(&base, length));
         state.draft_formatting.entry(state.draft_key().unwrap()).or_default().toggle_mark(0, 16, message_body::InlineMark::Bold);
     }
-    let panel = state.message_panel("Teste", "Dados fictícios", &state.messages, false, 1050.0, false);
+    let panel = state.message_panel("Teste", "Dados fictícios", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
     let mut tree = Tree::new(panel.as_widget());
     drop(panel);
     let mut updates = Vec::new(); let mut views = Vec::new();
@@ -73,7 +73,7 @@ fn edit_workload(count: usize, rich: bool) -> Value {
         let start = Instant::now(); drop(black_box(update(&mut state, event)));
         let update_ms = start.elapsed().as_secs_f64()*1000.0;
         let start = Instant::now();
-        let panel = state.message_panel("Teste", "Dados fictícios", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Teste", "Dados fictícios", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         tree.diff(panel.as_widget()); black_box(&panel); drop(panel);
         let view_ms = start.elapsed().as_secs_f64()*1000.0;
         if index >= 10 { updates.push(update_ms); views.push(view_ms); }

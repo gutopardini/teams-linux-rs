@@ -19,6 +19,7 @@ const MAX_CACHE_ENTRIES: usize = 64;
 pub const MAX_IMAGES: usize = 8;
 pub const INLINE_MAX_WIDTH: f32 = 400.0;
 pub const INLINE_MAX_HEIGHT: f32 = 640.0;
+pub const FILE_THUMBNAIL_WIDTH: f32 = 290.0;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InlineImage {
@@ -1179,15 +1180,20 @@ pub fn fingerprint(caption: &str, pictures: &[StagedImage]) -> String {
     format!("{:x}", hash.finalize())
 }
 
-/// File previews use the same proven AMS transport as inline images. SharePoint
-/// object URLs and non-image previews remain file cards, never image downloads.
+/// Image files can be promoted into the message body. Other files keep their
+/// thumbnail within the file card.
 pub fn file_preview_url(file: &ost::api::ChatFileRef) -> Option<&str> {
     let kind = file.file_type.as_deref().or_else(|| file.name.rsplit_once('.').map(|(_, ext)| ext))?;
-    if !["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"].iter().any(|ext|kind.eq_ignore_ascii_case(ext)) {
+    if !["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"].iter().any(|ext| kind.eq_ignore_ascii_case(ext)) {
         return None;
     }
+    let preview = validated_thumbnail(file)?;
+    Some(&preview.url)
+}
+
+fn validated_thumbnail(file: &ost::api::ChatFileRef) -> Option<&ost::api::ChatFilePreview> {
     let preview = file.preview.as_ref()?;
-    valid_media_url(&preview.url).then_some(preview.url.as_str())
+    valid_media_url(&preview.url).then_some(preview)
 }
 
 pub fn file_preview(file: &ost::api::ChatFileRef) -> Option<InlineImage> {
@@ -1195,7 +1201,22 @@ pub fn file_preview(file: &ost::api::ChatFileRef) -> Option<InlineImage> {
     let preview = file.preview.as_ref()?;
     Some(InlineImage {
         id: file.attachment_id.clone().unwrap_or_default(),
-        url: url.to_owned(), width: preview.width, height: preview.height,
+        url: url.to_owned(),
+        width: preview.width,
+        height: preview.height,
+    })
+}
+
+pub fn attachment_thumbnail(file: &ost::api::ChatFileRef, inline: &[InlineImage]) -> Option<InlineImage> {
+    let preview = validated_thumbnail(file)?;
+    if inline.iter().any(|image| image.url == preview.url) {
+        return None;
+    }
+    Some(InlineImage {
+        id: file.attachment_id.clone().unwrap_or_default(),
+        url: preview.url.clone(),
+        width: preview.width,
+        height: preview.height,
     })
 }
 
@@ -1854,10 +1875,14 @@ mod tests {
             object_url:"https://example.sharepoint.com/capture.png".into(),share_url:None,sender:None,time:None,
         };
         assert!(file_preview(&file).is_some());
-        file.file_type=Some("pdf".into()); assert!(file_preview(&file).is_none());
+        file.file_type = Some("csv".into());
+        assert!(file_preview(&file).is_none());
+        assert!(attachment_thumbnail(&file, &[]).is_some());
         file.file_type=Some("png".into());
         for url in ["https://example.sharepoint.com/capture.png", "http://api.asm.skype.com/v1/objects/0-test/views/imgo", "https://api.asm.skype.com.evil.test/v1/objects/0-test/views/imgo", "https://user:pass@api.asm.skype.com/v1/objects/0-test/views/imgo"] {
-            file.preview.as_mut().unwrap().url=url.into(); assert!(file_preview(&file).is_none());
+            file.preview.as_mut().unwrap().url=url.into();
+            assert!(file_preview(&file).is_none());
+            assert!(attachment_thumbnail(&file, &[]).is_none());
         }
     }
 

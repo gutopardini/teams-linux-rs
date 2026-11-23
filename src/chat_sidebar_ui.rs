@@ -265,7 +265,7 @@ pub fn view(state: &TeamsApp, shared_header: bool) -> Element<'static, AppMessag
                 .on_input(AppMessage::ChatListSearchChanged)
                 .size(16)
                 .padding([8, 12])
-                .style(ui_input(false))
+                .style(ui_input(true))
                 .width(Fill),
         ).padding(iced::Padding { top: 12.0, right: 20.0, left: 40.0, bottom: 0.0 }));
     }

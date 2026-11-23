@@ -12,6 +12,11 @@ pub const RICH_EDITOR: &str = "message-composer-rich";
 const FOCUS_STROKE: f32 = 2.0;
 const RADIUS: f32 = 16.0;
 
+pub fn editor_height_limit(window_height: f32, attachment_height: f32) -> f32 {
+    let preferred = (window_height * 0.5).clamp(64.0, 384.0);
+    preferred.min((window_height - 220.0 - attachment_height).max(64.0))
+}
+
 pub fn view<'a>(
     inner: Container<'a, AppMessage>,
     window_focused: bool,

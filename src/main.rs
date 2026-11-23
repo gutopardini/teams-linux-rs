@@ -1875,7 +1875,12 @@ fn history_message_height(
         .iter()
         .map(|file| {
             let name_lines = file.name.chars().count().div_ceil(file_columns).max(1);
-            (name_lines as f32 + 1.0) * (13.0 * preferences.line_height()) + 20.0
+            let thumbnail_height = images::attachment_thumbnail(file, &message.images)
+                .map_or(0.0, |preview| {
+                    let width = images::FILE_THUMBNAIL_WIDTH.min((content_width - 20.0).max(1.0));
+                    images::display_size(&preview, 0, 0, width, images::INLINE_MAX_HEIGHT).1 + 8.0
+                });
+            (name_lines as f32 + 1.0) * (13.0 * preferences.line_height()) + 20.0 + thumbnail_height
         })
         .sum();
     let body_height = text_lines as f32 * line_height
@@ -4235,6 +4240,7 @@ impl TeamsApp {
         &mut self,
         target: ClipboardPasteTarget,
         pasted: message_body::ComposerPaste,
+        open_formatting: bool,
     ) -> Task<AppMessage> {
         if !self.clipboard_target_is_current(&target) {
             self.status = tr("The draft changed during paste. Copy again in the current chat.").into();
@@ -4262,7 +4268,9 @@ impl TeamsApp {
         self.composer_content.perform(text_editor::Action::Edit(
             text_editor::Edit::Paste(std::sync::Arc::new(pasted.text)),
         ));
-        self.formatting_open = self.formatting_open || self.active_reply_target().is_none() || !pasted.formatting.is_empty();
+        self.formatting_open = self.formatting_open
+            || (open_formatting && self.active_reply_target().is_none())
+            || !pasted.formatting.is_empty();
         let draft = self.composer_content.text();
         let task = update_inner(self, AppMessage::DraftChanged(draft));
         if let Some(key) = self.draft_key() {
@@ -5750,6 +5758,40 @@ impl TeamsApp {
             self.search = "Ana".into();
             self.global_people_results = local_search_people(self, "Ana");
             self.global_message_error = Some(tr("Message search is unavailable for this account.").into());
+        }
+        if std::env::args().any(|arg| arg == "--multiline-composer-demo") {
+            self.draft = (1..=12).map(|index| format!("{index}. Review the notes for the example project."))
+                .collect::<Vec<_>>().join("\n");
+            self.composer_content = composer_decorations::Content::with_text(&self.draft);
+            if let Some(key) = self.draft_key() {
+                self.document_drafts.insert(key, DocumentDraft {
+                    path: Default::default(),
+                    name: "example-results.csv".into(),
+                    size: 1024,
+                    sha256: String::new(),
+                    client_message_id: "demo-composer-file".into(),
+                    publication_attempted: false,
+                });
+            }
+        }
+        if std::env::args().any(|arg| arg == "--file-caption-demo") {
+            let thumbnail_url = "https://api.asm.skype.com/v1/objects/0-demo-file/views/imgo";
+            let sample = images::demo_image();
+            self.media.complete(thumbnail_url.into(), Some(images::LoadedImage {
+                handle: sample.preview, width: sample.width, height: sample.height,
+                estimated_bytes: sample.preview_bytes,
+            }));
+            self.messages.push(GraphMessage {
+                id: "demo-file-caption".into(),
+                body: "Review notes\n\nPlease check the results in the attached example file. The first rows show the sample values and the last section lists the open questions.\n\n1. Check the sample data.\n2. Add comments to the draft.\n3. Confirm the next step.".into(),
+                is_mine: true,
+                files: vec![ost::api::ChatFileRef {
+                    preview: Some(ost::api::ChatFilePreview { url: thumbnail_url.into(), width: sample.width, height: sample.height }),
+                    attachment_id: Some("demo-file".into()), name: "example-results.csv".into(), file_type: Some("csv".into()),
+                    object_url: "https://example.sharepoint.com/example-results.csv".into(), share_url: None, sender: None, time: None,
+                }],
+                ..GraphMessage::default()
+            });
         }
 
         if std::env::args().any(|arg| arg == "--inline-image-demo" || arg == "--viewer-image-demo") {
@@ -7320,17 +7362,21 @@ impl TeamsApp {
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center);
-                if let Some(preview) = images::file_preview(file) {
+                let max_width = if let Some(preview) = images::attachment_thumbnail(file, &message.images) {
+                    let width = images::FILE_THUMBNAIL_WIDTH.min((content_width - 20.0).max(1.0));
                     file_row = row![column![
                         file_row,
-                        message_body::inline_image_view(&preview, &self.media, 220.0),
+                        message_body::inline_image_view(&preview, &self.media, width),
                     ]
                     .spacing(8)]
                     .align_y(Alignment::Center);
-                }
+                    width + 20.0
+                } else {
+                    420.0
+                };
                 body = body.push(
                     container(file_row)
-                        .max_width(420)
+                        .max_width(max_width)
                         .padding([8, 10])
                         .style(ui_surface(Tone::Canvas, true, 8.0)),
                 );
@@ -7339,8 +7385,9 @@ impl TeamsApp {
             let menu_open = self.message_menu_for.as_deref() == Some(message.id.as_str());
             let text_card_width = message.rich.as_deref().and_then(message_body::Document::standalone_text_card_width);
             let bubble_width = message_body::bubble_width(width, message.is_mine, compact);
+            let text_with_file = !message.files.is_empty() && !message.body.trim().is_empty();
             let expand_bubble = !message.is_deleted
-                && message.rich.as_deref().is_some_and(message_body::Document::combines_text_and_card);
+                && (text_with_file || message.rich.as_deref().is_some_and(message_body::Document::combines_text_and_card));
             let mut bubble = container(if expand_bubble { body.width(Fill) } else { body })
                 .padding(if text_card_width.is_some() { [0, 0] } else { [10, 14] })
                 .max_width(text_card_width.unwrap_or(bubble_width).min(bubble_width))
@@ -7983,9 +8030,10 @@ impl TeamsApp {
         subtitle: &'a str,
         messages: &'a [GraphMessage],
         loading: bool,
-        width: f32,
+        size: iced::Size,
         compact: bool,
     ) -> Element<'a, AppMessage> {
+        let width = size.width;
         let selected_chat = (self.section == Section::Chats)
             .then(|| self.selected_chat.as_deref())
             .flatten()
@@ -8295,6 +8343,15 @@ impl TeamsApp {
             tr("Send")
         };
         let quote_compose=self.active_reply_target().is_some();
+        let expanded = self.formatting_open || quote_compose || self.draft.contains('\n');
+        let extra_height = if has_pictures {
+            230.0
+        } else if has_document || preparing_document {
+            72.0
+        } else {
+            0.0
+        };
+        let editor_limit = composer_frame::editor_height_limit(size.height, extra_height);
         let mut composer_input: Option<Element<'_, AppMessage>> = Some(if !drafts_ready {
             container(
                 text(tr("Restoring drafts…"))
@@ -8318,8 +8375,8 @@ impl TeamsApp {
                 .padding(if compact { [6, 10] } else { [12, 10] })
                 .size(u32::from(self.preferences.message_size))
                 .height(iced::Length::Shrink)
-                .min_height(if self.formatting_open { 104.0 } else { f32::from(self.preferences.message_size) * 1.5 + 24.0 })
-                .max_height(composer_decorations::MAX_HEIGHT)
+                .min_height((if self.formatting_open { 104.0 } else { f32::from(self.preferences.message_size) * 1.5 + 24.0 }).min(editor_limit))
+                .max_height(editor_limit)
                 .highlight_with::<message_body::ComposerHighlighter>(
                     settings.clone(),
                     message_body::composer_highlight_format,
@@ -8330,7 +8387,7 @@ impl TeamsApp {
                 editor = editor.key_binding(move |key| settings::composer_key(key, enter_sends));
             }
             let decorated = composer_decorations::view(editor, &self.composer_content, settings,
-                self.preferences.message_size, iced::Padding::from(if compact { [6, 10] } else { [12, 10] }));
+                self.preferences.message_size, iced::Padding::from(if compact { [6, 10] } else { [12, 10] }), editor_limit);
             paste::rich_composer(decorated, self.draft_key().unwrap_or_default())
         } else {
             let editor = text_input(tr("Type a message"), &self.draft)
@@ -8533,7 +8590,7 @@ impl TeamsApp {
                 .style(ui_surface(Tone::Selected, true, 6.0)),
             );
         }
-        if self.formatting_open || quote_compose { compose = compose.push(composer_input.take().unwrap()); }
+        if expanded { compose = compose.push(composer_input.take().unwrap()); }
         if let Some(stage) = self
             .pending_document_stage
             .as_ref()
@@ -8787,7 +8844,6 @@ impl TeamsApp {
             )),
             tr("Insert emoji"),
         );
-        let expanded = self.formatting_open || quote_compose;
         let mut controls = iced::widget::Row::new().spacing(4).align_y(Alignment::Center);
         if !expanded {
             controls = controls.push(composer_input.take().unwrap());
@@ -9123,7 +9179,7 @@ impl TeamsApp {
             .into()
     }
 
-    fn conversation_view(&self, width: f32, compact: bool) -> Element<'_, AppMessage> {
+    fn conversation_view(&self, size: iced::Size, compact: bool) -> Element<'_, AppMessage> {
         let Some(chat) = self
             .selected_chat
             .as_ref()
@@ -9159,7 +9215,7 @@ impl TeamsApp {
             &chat.subtitle,
             &self.messages,
             self.loading_messages,
-            width,
+            size,
             compact,
         )
     }
@@ -9339,7 +9395,8 @@ impl TeamsApp {
             .into()
     }
 
-    fn team_view(&self, width: f32, compact: bool) -> Element<'_, AppMessage> {
+    fn team_view(&self, size: iced::Size, compact: bool) -> Element<'_, AppMessage> {
+        let width = size.width;
         if compact && self.show_conversation_list {
             return self.team_list(Fill);
         }
@@ -9356,7 +9413,7 @@ impl TeamsApp {
                 &team.name,
                 &self.channel_messages,
                 self.loading_channel_messages,
-                if compact { width } else { width - 360.0 },
+                iced::Size::new(if compact { width } else { width - 360.0 }, size.height),
                 compact,
             ),
             _ => {
@@ -12574,13 +12631,19 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         state.status = tr("The draft changed during paste. Copy again in the current chat.").into();
                         return Task::none();
                     }
-                    if state.formatting_open || state.active_reply_target().is_some() {
+                    let text = if text.contains('\r') {
+                        text.replace("\r\n", "\n").replace('\r', "\n")
+                    } else {
+                        text
+                    };
+                    if state.composer_uses_editor() || text.contains('\n') {
                         return state.insert_clipboard_document(
                             target,
                             message_body::ComposerPaste {
                                 text,
                                 formatting: message_body::ComposerFormatting::default(),
                             },
+                            false,
                         );
                     }
                     state.clipboard_sequence = state.clipboard_sequence.wrapping_add(1);
@@ -12597,7 +12660,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         return Task::none();
                     }
                     if let Some(pasted) = message_body::Document::from_clipboard_html(&html) {
-                        return state.insert_clipboard_document(target, pasted);
+                        return state.insert_clipboard_document(target, pasted, true);
                     }
                     if !plain.is_empty() {
                         return state.insert_clipboard_document(
@@ -12606,6 +12669,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                                 text: plain,
                                 formatting: message_body::ComposerFormatting::default(),
                             },
+                            true,
                         );
                     }
                     state.status = tr("Could not convert the copied HTML to safe text.").into();
@@ -20116,7 +20180,7 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
                     Section::Chats if compact && state.show_conversation_list => {
                         state.chat_list(Fill)
                     }
-                    Section::Chats if compact => state.conversation_view(width, true),
+                    Section::Chats if compact => state.conversation_view(iced::Size::new(width, size.height), true),
                     Section::Chats => {
                         let sidebar_width = f32::from(state.preferences.chat_sidebar_width)
                             .min((width - 425.0).max(240.0));
@@ -20133,10 +20197,10 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
                             mouse_area(splitter)
                                 .interaction(iced::mouse::Interaction::ResizingHorizontally)
                                 .on_press(AppMessage::StartSidebarResize),
-                            state.conversation_view(width - sidebar_width - splitter_width, false)
+                            state.conversation_view(iced::Size::new(width - sidebar_width - splitter_width, size.height), false)
                         ].height(Fill).into()
                     }
-                    Section::Teams => state.team_view(width, compact),
+                    Section::Teams => state.team_view(iced::Size::new(width, size.height), compact),
                     Section::Calendar => state.calendar_view(),
                     Section::Calls => state.calls_view(),
                     _ => state.section_placeholder(),
@@ -20624,29 +20688,29 @@ mod tests {
         use iced::advanced::widget::Tree;
         performance::start_counting();
         let mut state = TeamsApp::from_client_id(String::new());
-        let panel = state.message_panel("Teste", "", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         let mut tree = Tree::new(panel.as_widget());
         drop(panel);
         let builds = performance::history_builds();
         assert_eq!(builds, 1);
         for value in ["Olá", "Olá mundo", "Olá", ""] {
             drop(update(&mut state, AppMessage::DraftChanged(value.into())));
-            let panel = state.message_panel("Teste", "", &state.messages, false, 1050.0, false);
+            let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
             tree.diff(panel.as_widget());
         }
         assert_eq!(performance::history_builds(), builds);
         let selected_message = state.messages[0].id.clone();
         drop(update(&mut state, AppMessage::OpenMessageMenu(selected_message)));
-        let panel = state.message_panel("Teste", "", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         tree.diff(panel.as_widget());
         drop(panel);
         assert_eq!(performance::history_builds(), builds + 1);
         drop(update(&mut state, AppMessage::ToggleAppearance));
-        let panel = state.message_panel("Teste", "", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         tree.diff(panel.as_widget());
         drop(panel);
         assert_eq!(performance::history_builds(), builds + 2);
-        let panel = state.message_panel("Teste", "", &state.messages, false, 900.0, true);
+        let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(900.0, 580.0), true);
         tree.diff(panel.as_widget());
         assert_eq!(performance::history_builds(), builds + 3);
     }
@@ -22996,7 +23060,7 @@ mod tests {
         )
         .unwrap();
 
-        let _ = state.insert_clipboard_document(target, pasted);
+        let _ = state.insert_clipboard_document(target, pasted, true);
 
         assert_eq!(state.draft, "keep Review docs end");
         assert!(state.formatting_open);
@@ -23005,6 +23069,52 @@ mod tests {
         assert!(formatting.links.iter().any(|range| {
             range.start == 12 && range.end == 16 && range.url == "https://example.com/docs"
         }));
+    }
+
+    #[test]
+    fn multiline_plain_paste_grows_the_editor_up_to_the_window_limit() {
+        use iced::advanced::{Layout, layout, widget::{Id, Operation, Tree, operation::Focusable}};
+
+        #[derive(Default)]
+        struct EditorBounds(Option<iced::Rectangle>);
+        impl Operation for EditorBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn focusable(&mut self, id: Option<&Id>, bounds: iced::Rectangle, _: &mut dyn Focusable) {
+                if id == Some(&Id::new(composer_frame::RICH_EDITOR)) { self.0 = Some(bounds); }
+            }
+        }
+        let renderer = chat_render_tests::headless_renderer();
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        let key = state.draft_key().unwrap();
+        let epoch = state.session_epoch;
+        let measure = |state: &TeamsApp, size: iced::Size| {
+            let mut view = state.message_panel("Example", "", &state.messages, false, size, size.width < 1000.0);
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, size));
+            let mut bounds = EditorBounds::default();
+            view.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            bounds.0.expect("multiline text uses the rich editor")
+        };
+        let text = (1..=13).map(|line| format!("Example line {line}")).collect::<Vec<_>>().join("\r\n");
+        state.clipboard_paste_target = Some(ClipboardPasteTarget {
+            epoch, draft_key: key.clone(), revision: 0, selection: (0, 0),
+        });
+        drop(update_inner(&mut state, AppMessage::ClipboardRead(epoch, key.clone(), Ok(images::Paste::Text(text.clone())))));
+        assert_eq!(state.draft, text.replace("\r\n", "\n"));
+        assert!(!state.formatting_open);
+        let desktop = measure(&state, iced::Size::new(1400.0, 900.0));
+        assert!(desktop.height > 160.0, "the old editor limit must not clip the long paste: {desktop:?}");
+        assert!(desktop.width > 900.0, "the toolbar uses its own row: {desktop:?}");
+
+        let end = state.draft.chars().count();
+        state.clipboard_paste_target = Some(ClipboardPasteTarget {
+            epoch, draft_key: key.clone(), revision: state.draft_versions[&key], selection: (end, end),
+        });
+        drop(update_inner(&mut state, AppMessage::ClipboardRead(epoch, key, Ok(images::Paste::Text("\nExtra line".repeat(60))))));
+        assert!(state.draft.ends_with("Extra line"));
+        let compact = measure(&state, iced::Size::new(800.0, 540.0));
+        assert!(compact.height <= composer_frame::editor_height_limit(540.0, 0.0) + 12.0, "{compact:?}");
     }
 
     #[test]
@@ -23487,7 +23597,7 @@ mod tests {
         performance::start_counting();
         let mut state = TeamsApp::from_client_id(String::new());
         state.demo_mode = false;
-        let panel = state.message_panel("Teste", "", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         let mut tree = Tree::new(panel.as_widget());
         drop(panel);
         let builds = performance::history_builds();
@@ -23500,7 +23610,7 @@ mod tests {
         assert_eq!(state.messages.last().map(|message| message.body.as_str()), Some("Oi"));
         assert!(state.messages.last().unwrap().id.starts_with("local:"));
         assert!(state.shown_chat_history < state.messages.len());
-        let panel = state.message_panel("Teste", "", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Teste", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         tree.diff(panel.as_widget());
         drop(panel);
         assert_eq!(performance::history_builds(), builds);

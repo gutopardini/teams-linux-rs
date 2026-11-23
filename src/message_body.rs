@@ -683,15 +683,16 @@ pub fn composer_highlight_format(
             ..Font::DEFAULT
         }
     };
+    let color = highlight.color.map_or_else(
+        || crate::appearance::tone(theme, if highlight.link {
+            crate::appearance::Tone::Accent
+        } else {
+            crate::appearance::Tone::Text
+        }),
+        crate::appearance::rgb,
+    );
     iced::advanced::text::highlighter::Format {
-        color: highlight
-            .color
-            .map(crate::appearance::rgb)
-            .or_else(|| {
-                highlight
-                    .link
-                    .then(|| crate::appearance::tone(theme, crate::appearance::Tone::Accent))
-            }),
+        color: Some(color),
         font: Some(font),
     }
 }
@@ -6424,7 +6425,7 @@ mod tests {
                 assert_eq!(runs, vec![(0..line.len(), ComposerHighlight::default())]);
                 let format = composer_highlight_format(&runs[0].1, &Theme::Dark);
                 assert_eq!(format.font, Some(typography::regular()));
-                assert!(format.color.is_none(), "plain text follows the editor theme");
+                assert_eq!(format.color, Some(crate::appearance::tone(&Theme::Dark, crate::appearance::Tone::Text)));
             }
         }
     }

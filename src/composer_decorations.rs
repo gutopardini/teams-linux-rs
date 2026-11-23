@@ -9,8 +9,6 @@ use iced::widget::{text, text_editor};
 use std::{cell::RefCell, ops::Deref};
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const MAX_HEIGHT: f32 = 160.0;
-
 /// The optional geometry editor receives exactly the same actions as the input
 /// editor, including scrolling. It is allocated only when rich editing is shown.
 pub struct Content {
@@ -188,14 +186,14 @@ impl Geometry {
 }
 
 pub fn view<'a>(inner: impl Into<Element<'a, AppMessage>>, content: &'a Content,
-    settings: ComposerHighlightSettings, size: u16, padding: Padding) -> Element<'a, AppMessage>
+    settings: ComposerHighlightSettings, size: u16, padding: Padding, max_height: f32) -> Element<'a, AppMessage>
 {
-    Element::new(Decorated { inner: inner.into(), content, settings, size: f32::from(size), padding })
+    Element::new(Decorated { inner: inner.into(), content, settings, size: f32::from(size), padding, max_height })
 }
 
 struct Decorated<'a> {
     inner: Element<'a, AppMessage>, content: &'a Content,
-    settings: ComposerHighlightSettings, size: f32, padding: Padding,
+    settings: ComposerHighlightSettings, size: f32, padding: Padding, max_height: f32,
 }
 
 impl Widget<AppMessage, Theme, iced::Renderer> for Decorated<'_> {
@@ -208,7 +206,7 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Decorated<'_> {
         let mut geometry = self.content.geometry.borrow_mut();
         let geometry = geometry.get_or_insert_with(|| Geometry::new(self.content, &self.settings));
         geometry.update(&self.settings, Size::new((node.size().width - self.padding.x()).max(0.0),
-            (limits.max().height.min(MAX_HEIGHT) - self.padding.y()).max(0.0)), renderer.default_font(), self.size);
+            (limits.max().height.min(self.max_height) - self.padding.y()).max(0.0)), renderer.default_font(), self.size);
         node
     }
     fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &iced::Renderer,

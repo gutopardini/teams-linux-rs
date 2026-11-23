@@ -80,7 +80,7 @@ fn identical_refresh_and_sidebar_scroll_retain_both_widget_trees() {
     state.messages = vec![message("001"), message("002")];
     let chat_id = state.selected_chat.clone().unwrap();
     performance::start_counting();
-    let panel = state.message_panel("Test", "", &state.messages, false, 1050.0, false);
+    let panel = state.message_panel("Test", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
     let mut history = Tree::new(panel.as_widget());
     drop(panel);
     let list = state.chat_list(312.into());
@@ -90,7 +90,7 @@ fn identical_refresh_and_sidebar_scroll_retain_both_widget_trees() {
     drop(update(&mut state, AppMessage::RefreshedMessages(epoch, chat_id.clone(),
         Ok((TeamsSession::test_fixture(), MessagePage { messages: vec![message("002")], before: None })))));
     drop(update(&mut state, AppMessage::ChatListScrolled(72.0, 700.0)));
-    let panel = state.message_panel("Test", "", &state.messages, false, 1050.0, false);
+    let panel = state.message_panel("Test", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
     history.diff(panel.as_widget());
     drop(panel);
     let list = state.chat_list(312.into());
@@ -100,7 +100,7 @@ fn identical_refresh_and_sidebar_scroll_retain_both_widget_trees() {
     assert_eq!(performance::chat_list_builds(), 1);
     drop(update(&mut state, AppMessage::RefreshedMessages(epoch, chat_id,
         Ok((TeamsSession::test_fixture(), MessagePage { messages: vec![message("003")], before: None })))));
-    let panel = state.message_panel("Test", "", &state.messages, false, 1050.0, false);
+    let panel = state.message_panel("Test", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
     history.diff(panel.as_widget());
     assert_eq!(performance::history_builds(), 2);
     assert_eq!(state.messages.len(), 3);
@@ -133,7 +133,7 @@ fn repeated_geometry_notifications_do_not_rebuild_native_history() {
     let mut state = TeamsApp::from_client_id(String::new());
     state.messages = performance::messages(50);
     performance::start_counting();
-    let panel = state.message_panel("Test", "", &state.messages, false, 1050.0, false);
+    let panel = state.message_panel("Test", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
     let mut tree = Tree::new(panel.as_widget());
     drop(panel);
     let chat_id = state.selected_chat.clone().unwrap();
@@ -143,7 +143,7 @@ fn repeated_geometry_notifications_do_not_rebuild_native_history() {
             content_height: 18000.0 + index as f32, viewport_height: 720.0,
             viewport_width: 1050.0, compact: false,
         })));
-        let panel = state.message_panel("Test", "", &state.messages, false, 1050.0, false);
+        let panel = state.message_panel("Test", "", &state.messages, false, iced::Size::new(1050.0, 840.0), false);
         tree.diff(panel.as_widget());
     }
     assert_eq!(performance::history_builds(), 1);
