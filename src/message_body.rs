@@ -4068,7 +4068,14 @@ impl Document {
             }
             line_start = line_end + 1;
         }
-        let blocks = editor_tables(blocks, &formatting.tables);
+        let mut blocks = editor_tables(blocks, &formatting.tables);
+        // Rich outgoing messages use the editor document for both the
+        // optimistic bubble and the HTML sent to Graph. Preserve links that
+        // users pasted or typed even when another part of the message is
+        // formatted (for example, a bulleted list).
+        for block in &mut blocks {
+            linkify_nested(block);
+        }
         Self { blocks }
     }
 
