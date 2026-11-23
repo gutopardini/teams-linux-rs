@@ -7924,9 +7924,9 @@ impl TeamsApp {
             .padding(if compact { [8, 12] } else { [10, 16] })
             .style(|_| iced::widget::container::Style {
                 background: Some(Background::Color(Color {
-                    r: 0.22,
-                    g: 0.15,
-                    b: 0.32,
+                    r: 0.20,
+                    g: 0.20,
+                    b: 0.294,
                     a: 1.0,
                 })),
                 ..Default::default()
