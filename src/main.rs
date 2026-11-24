@@ -3043,6 +3043,7 @@ fn mark_chat_read_task(state: &mut TeamsApp, chat_id: &str) -> Task<AppMessage> 
     )
 }
 
+#[cfg(test)]
 fn read_receipt_marker_indices(
     messages: &[GraphMessage],
     receipts: &[ost::api::ReadReceipt],
@@ -3073,11 +3074,38 @@ fn read_receipt_marker_indices(
         .collect()
 }
 
-fn outgoing_message_status_marker(seen: bool) -> Element<'static, AppMessage> {
-    let marker: Element<'static, AppMessage> = if seen {
-        icon_tone(Icon::Eye, Tone::Accent, 15.0)
-    } else {
-        container(icon_tone(Icon::Check, Tone::Accent, 9.0))
+fn read_receipt_readers(
+    messages: &[GraphMessage], receipts: &[ost::api::ReadReceipt],
+    current_user_id: &str, names: &HashMap<String, String>,
+) -> HashMap<String, Vec<String>> {
+    let positions: HashMap<&str, usize> = messages.iter().enumerate()
+        .map(|(index, message)| (message.id.as_str(), index)).collect();
+    let current_user = reaction_identity(current_user_id);
+    let mut readers: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for receipt in receipts {
+        let identity = reaction_identity(&receipt.user);
+        if identity.is_empty() || (!current_user.is_empty() && identity == current_user) {
+            continue;
+        }
+        let Some(&frontier) = positions.get(receipt.message_id.as_str()) else { continue; };
+        let name = names.get(&identity).and_then(|name| sender_names::known(name))
+            .or_else(|| (!receipt.user.contains(':')).then(|| sender_names::known(&receipt.user)).flatten())
+            .unwrap_or_else(|| tr("Unnamed participant"));
+        for message in &messages[..=frontier] {
+            if message.is_mine && !message.id.is_empty() && !message.id.starts_with("local:") {
+                let entries = readers.entry(message.id.clone()).or_default();
+                if !entries.iter().any(|(id, _)| *id == identity) {
+                    entries.push((identity.clone(), name.to_owned()));
+                }
+            }
+        }
+    }
+    readers.into_iter().map(|(id, entries)| (id, entries.into_iter().map(|(_, name)| name).collect())).collect()
+}
+
+fn outgoing_message_status_marker(readers: &[String]) -> Element<'static, AppMessage> {
+    if readers.is_empty() {
+        return hint(container(icon_tone(Icon::Check, Tone::Accent, 9.0))
             .width(14.0)
             .height(14.0)
             .center_x(14.0)
@@ -3089,10 +3117,16 @@ fn outgoing_message_status_marker(seen: bool) -> Element<'static, AppMessage> {
                     .width(1.25)
                     .color(rgb(0x7b83eb)),
                 ..Default::default()
-            })
-            .into()
-    };
-    hint(marker, tr(if seen { "Seen" } else { "Delivered" }))
+            }), tr("Delivered"));
+    }
+    let mut content = column![text(tr("Seen by")).size(14).style(ui_text(Tone::Muted))].spacing(8);
+    for name in readers {
+        content = content.push(text(name.clone()).size(14).style(ui_text(Tone::Secondary)));
+    }
+    let panel = container(scrollable(content).height(iced::Length::Shrink).style(ui_scroll))
+        .max_height(240).padding(12).style(ui_surface(Tone::Surface, true, 6.0));
+    tooltip(icon_tone(Icon::Eye, Tone::Accent, 15.0), panel, tooltip::Position::Top)
+        .gap(8).padding(0).snap_within_viewport(true).delay(Duration::from_millis(350)).into()
 }
 
 fn unread_separator_index(
@@ -6965,10 +6999,10 @@ impl TeamsApp {
         if window.before_height > 0.0 {
             history = history.push(space::vertical().height(window.before_height));
         }
-        let read_markers = if self.section == Section::Chats {
-            read_receipt_marker_indices(messages, &self.read_receipts, &self.user_id)
+        let readers = if self.section == Section::Chats {
+            read_receipt_readers(&self.messages, &self.read_receipts, &self.user_id, &reaction_names)
         } else {
-            HashSet::new()
+            HashMap::new()
         };
         let unread_marker_index = if self.section == Section::Chats {
             let local_frontier = self
@@ -7670,8 +7704,9 @@ impl TeamsApp {
                 && !message.is_deleted
                 && !message.id.starts_with("local:")
             {
-                message_content = message_content
-                    .push(outgoing_message_status_marker(read_markers.contains(&index)));
+                message_content = message_content.push(outgoing_message_status_marker(
+                    readers.get(&message.id).map(Vec::as_slice).unwrap_or(&[]),
+                ));
             }
             let important = message_priority_label(message.importance).is_some();
             let message_row: Element<'_, AppMessage> = if message.is_mine && self.section == Section::Chats {
@@ -13696,9 +13731,11 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             let poll_interval =
                 realtime_poll_interval_ticks(state.trouter_connected, state.sync_failures);
             let poll_due = state.sync_tick % poll_interval == 0;
+            let receipt_due = state.section == Section::Chats && state.window_focused
+                && state.sync_tick % 6 == 0;
             let chat_push_received = state.realtime_chat_dirty;
             let history_push_received = selected_conversation_has_realtime_changes(state);
-            if !poll_due && !chat_push_received && !history_push_received {
+            if !poll_due && !receipt_due && !chat_push_received && !history_push_received {
                 return Task::batch([presence_task, calendar_task, desktop_actions]);
             }
             let mut tasks = vec![presence_task, calendar_task, desktop_actions];
@@ -13757,7 +13794,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 messages_scheduled = true;
             }
             if state.section == Section::Chats
-                && poll_due
+                && (poll_due || receipt_due)
                 && !state.read_receipts_syncing
                 && let Some(chat_id) = state.selected_chat.clone()
             {
@@ -26365,6 +26402,26 @@ mod tests {
             horizon: "10;10;in-3".into(),
         }];
         assert!(read_receipt_marker_indices(&messages, &self_receipt, "me").is_empty());
+    }
+
+    #[test]
+    fn readers_follow_the_full_history_and_exclude_self_and_unknown_frontiers() {
+        let messages = vec![
+            GraphMessage { id: "out-1".into(), is_mine: true, ..Default::default() },
+            GraphMessage { id: "in-2".into(), ..Default::default() },
+            GraphMessage { id: "out-3".into(), is_mine: true, ..Default::default() },
+            GraphMessage { id: "out-4".into(), is_mine: true, ..Default::default() },
+        ];
+        let receipts = vec![
+            ost::api::ReadReceipt { user: "8:orgid:peer".into(), message_id: "out-3".into(), horizon: String::new() },
+            ost::api::ReadReceipt { user: "8:orgid:ME".into(), message_id: "out-4".into(), horizon: String::new() },
+            ost::api::ReadReceipt { user: "8:orgid:other".into(), message_id: "missing".into(), horizon: String::new() },
+        ];
+        let names = HashMap::from([("peer".to_string(), "Alex".to_string())]);
+        let readers = read_receipt_readers(&messages, &receipts, "me", &names);
+        assert_eq!(readers.get("out-1"), Some(&vec!["Alex".to_owned()]));
+        assert_eq!(readers.get("out-3"), Some(&vec!["Alex".to_owned()]));
+        assert!(!readers.contains_key("out-4"));
     }
 
     #[test]
