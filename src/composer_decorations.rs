@@ -46,17 +46,22 @@ struct Geometry {
     bounds: Size,
     font: Font,
     size: f32,
+    gutter: f32,
     painted_revision: Option<u64>,
     font_version: Option<iced::advanced::graphics::text::Version>,
     strokes: Vec<Stroke>,
     backgrounds: Vec<Stroke>,
+    markers: Vec<Marker>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Stroke { bounds: Rectangle, color: Ink }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Ink { Text, Link, Color(u32), Background(u32) }
+enum Ink { Text, Link, Color(u32), Background(u32), Code, Quote, QuoteBar }
+
+#[derive(Clone, Debug, PartialEq)]
+struct Marker { x: f32, y: f32, size: f32, text: String }
 
 fn add_stroke(output: &mut Vec<Stroke>, bounds: Rectangle, color: Ink) {
     if let Some(last) = output.last_mut().filter(|last| last.color == color
@@ -86,13 +91,13 @@ impl Geometry {
         let mut editor = Editor::with_text(&content.text());
         editor.move_to(content.cursor());
         Self { editor, highlighter: ComposerHighlighter::new(settings), settings: settings.clone(),
-            bounds: Size::ZERO, font: Font::default(), size: 0.0, painted_revision: None, font_version: None,
-            strokes: Vec::new(), backgrounds: Vec::new() }
+            bounds: Size::ZERO, font: Font::default(), size: 0.0, gutter: 0.0, painted_revision: None, font_version: None,
+            strokes: Vec::new(), backgrounds: Vec::new(), markers: Vec::new() }
     }
 
-    fn update(&mut self, settings: &ComposerHighlightSettings, bounds: Size, font: Font, size: f32) {
+    fn update(&mut self, settings: &ComposerHighlightSettings, bounds: Size, font: Font, size: f32, gutter: f32) {
         let font_version = iced::advanced::graphics::text::font_system().read().expect("font system").version();
-        if self.settings != *settings || self.bounds != bounds || self.font != font || self.size != size || self.font_version != Some(font_version) {
+        if self.settings != *settings || self.bounds != bounds || self.font != font || self.size != size || self.gutter != gutter || self.font_version != Some(font_version) {
             self.painted_revision = None;
         }
         self.font_version = Some(font_version);
@@ -101,6 +106,7 @@ impl Geometry {
         self.bounds = bounds;
         self.font = font;
         self.size = size;
+        self.gutter = gutter;
         self.editor.update(bounds, font, Pixels(size), text::LineHeight::default(), text::Wrapping::Word, &mut self.highlighter);
     }
 
@@ -109,6 +115,8 @@ impl Geometry {
         self.editor.highlight(self.font, &mut self.highlighter,
             |highlight| message_body::composer_highlight_format(highlight, theme));
         self.backgrounds.clear();
+        self.markers.clear();
+        self.paint_structure();
         let buffer = self.editor.buffer();
         let mut line = None;
         let mut boundaries = Vec::new();
@@ -183,17 +191,69 @@ impl Geometry {
         self.strokes = underlines;
         self.painted_revision = Some(revision);
     }
+
+    fn paint_structure(&mut self) {
+        let buffer = self.editor.buffer();
+        let mut seen = None;
+        for run in buffer.layout_runs() {
+            let line_index = run.line_i;
+            let first = seen != Some(line_index);
+            seen = Some(line_index);
+            let font_size = run.glyphs.first().map(|glyph| glyph.font_size).unwrap_or(self.size).max(1.0);
+            let top = run.line_y - font_size * 0.9;
+            let height = font_size * 1.25;
+            let quoted = self.settings.formatting.quote_blocks.iter().any(|range| range.start <= line_index && line_index < range.end);
+            let code = self.settings.formatting.code_blocks.iter().any(|range| range.start <= line_index && line_index < range.end);
+            if code || quoted {
+                self.backgrounds.push(Stroke {
+                    bounds: Rectangle { x: 0.0, y: top, width: self.bounds.width.max(1.0), height },
+                    color: if code { Ink::Code } else { Ink::Quote },
+                });
+            }
+            if quoted && self.gutter > 0.0 {
+                self.backgrounds.push(Stroke {
+                    bounds: Rectangle { x: -self.gutter + 4.0, y: top, width: 3.0, height },
+                    color: Ink::QuoteBar,
+                });
+            }
+            if first {
+                if let Some(list) = self.settings.formatting.lists.iter().find(|range| range.start <= line_index && line_index < range.end) {
+                    let text = match list.kind {
+                        message_body::ListKind::Unordered => "•".to_owned(),
+                        message_body::ListKind::Ordered => format!("{}.", line_index - list.start + 1),
+                    };
+                    self.markers.push(Marker {
+                        x: -self.gutter + if quoted { 16.0 } else { 4.0 },
+                        y: top,
+                        size: font_size,
+                        text,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn ink_color(ink: Ink, theme: &Theme) -> Option<iced::Color> {
+    use crate::appearance::{tone, Tone};
+    Some(match ink {
+        Ink::Color(value) | Ink::Background(value) => crate::appearance::rgb(value),
+        Ink::Text => tone(theme, Tone::Text),
+        Ink::Link => tone(theme, Tone::Accent),
+        Ink::Code | Ink::Quote => tone(theme, Tone::Canvas),
+        Ink::QuoteBar => tone(theme, Tone::QuoteBar),
+    })
 }
 
 pub fn view<'a>(inner: impl Into<Element<'a, AppMessage>>, content: &'a Content,
-    settings: ComposerHighlightSettings, size: u16, padding: Padding, max_height: f32) -> Element<'a, AppMessage>
+    settings: ComposerHighlightSettings, size: u16, padding: Padding, max_height: f32, gutter: f32) -> Element<'a, AppMessage>
 {
-    Element::new(Decorated { inner: inner.into(), content, settings, size: f32::from(size), padding, max_height })
+    Element::new(Decorated { inner: inner.into(), content, settings, size: f32::from(size), padding, max_height, gutter })
 }
 
 struct Decorated<'a> {
     inner: Element<'a, AppMessage>, content: &'a Content,
-    settings: ComposerHighlightSettings, size: f32, padding: Padding, max_height: f32,
+    settings: ComposerHighlightSettings, size: f32, padding: Padding, max_height: f32, gutter: f32,
 }
 
 impl Widget<AppMessage, Theme, iced::Renderer> for Decorated<'_> {
@@ -206,7 +266,7 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Decorated<'_> {
         let mut geometry = self.content.geometry.borrow_mut();
         let geometry = geometry.get_or_insert_with(|| Geometry::new(self.content, &self.settings));
         geometry.update(&self.settings, Size::new((node.size().width - self.padding.x()).max(0.0),
-            (limits.max().height.min(self.max_height) - self.padding.y()).max(0.0)), renderer.default_font(), self.size);
+            (limits.max().height.min(self.max_height) - self.padding.y()).max(0.0)), renderer.default_font(), self.size, self.gutter);
         node
     }
     fn update(&mut self, tree: &mut Tree, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor, renderer: &iced::Renderer,
@@ -223,15 +283,36 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Decorated<'_> {
         // same editor at an absolute Y offset loses glyphs on the tested Iced
         // wgpu path; a renderer translation preserves glyphs, caret and clip.
         // Input/layout/IME operations keep their normal window coordinates.
-        let Some(clip) = layout.bounds().shrink(self.padding).intersection(viewport) else { return; };
+        let Some(outer) = layout.bounds().intersection(viewport) else { return; };
+        let Some(clip) = layout.bounds().shrink(self.padding).intersection(&outer) else { return; };
         let origin = layout.bounds().position() + Vector::new(self.padding.left, self.padding.top);
         if let Some(geometry) = self.content.geometry.borrow().as_ref() {
             for background in &geometry.backgrounds {
                 let translated = background.bounds + Vector::new(origin.x, origin.y);
-                if let Some(bounds) = translated.intersection(&clip) {
-                    let Ink::Background(value) = background.color else { continue; };
-                    renderer.fill_quad(renderer::Quad { bounds, ..Default::default() }, crate::appearance::rgb(value));
+                let limit = if background.bounds.x < 0.0 { &outer } else { &clip };
+                if let Some(bounds) = translated.intersection(limit) {
+                    let Some(color) = ink_color(background.color, theme) else { continue; };
+                    renderer.fill_quad(renderer::Quad { bounds, ..Default::default() }, color);
                 }
+            }
+            use iced::advanced::text::Renderer as _;
+            for marker in &geometry.markers {
+                renderer.fill_text(
+                    iced::advanced::text::Text {
+                        content: marker.text.clone(),
+                        bounds: Size::new(self.gutter.max(marker.size), marker.size * 1.4),
+                        size: Pixels(marker.size),
+                        line_height: iced::advanced::text::LineHeight::default(),
+                        font: crate::typography::regular(),
+                        align_x: iced::advanced::text::Alignment::Left,
+                        align_y: iced::alignment::Vertical::Top,
+                        shaping: iced::advanced::text::Shaping::Advanced,
+                        wrapping: iced::advanced::text::Wrapping::None,
+                    },
+                    iced::Point::new(origin.x + marker.x, origin.y + marker.y),
+                    crate::appearance::tone(theme, crate::appearance::Tone::Secondary),
+                    outer,
+                );
             }
         }
         let position = layout.position();
@@ -245,12 +326,7 @@ impl Widget<AppMessage, Theme, iced::Renderer> for Decorated<'_> {
             for stroke in &geometry.strokes {
                 let translated = stroke.bounds + Vector::new(origin.x, origin.y);
                 if let Some(bounds) = translated.intersection(&clip) {
-                    let color = match stroke.color {
-                        Ink::Color(value) => crate::appearance::rgb(value),
-                        Ink::Text => crate::appearance::tone(theme, crate::appearance::Tone::Text),
-                        Ink::Link => crate::appearance::tone(theme, crate::appearance::Tone::Accent),
-                        Ink::Background(value) => crate::appearance::rgb(value),
-                    };
+                    let Some(color) = ink_color(stroke.color, theme) else { continue; };
                     renderer.fill_quad(renderer::Quad { bounds, ..Default::default() }, color);
                 }
             }
@@ -278,9 +354,10 @@ mod tests {
                 .load_font(std::borrow::Cow::Borrowed(crate::typography::REGULAR_BYTES));
         });
         let content = Content::with_text(value);
-        let settings = ComposerHighlightSettings::new(value, formatting);
+        let gutter = message_body::composer_gutter(&formatting);
+        let settings = ComposerHighlightSettings::new(value, formatting, 16);
         let mut geometry = Geometry::new(&content, &settings);
-        geometry.update(&settings, Size::new(width, height), crate::typography::regular(), 16.0);
+        geometry.update(&settings, Size::new(width, height), crate::typography::regular(), 16.0, gutter);
         geometry.paint(content.revision, &Theme::Dark);
         *content.geometry.borrow_mut() = Some(geometry);
         content
@@ -324,6 +401,22 @@ mod tests {
         formatting.toggle_mark(2, 4, InlineMark::Strike);
         assert_eq!(flags(&formatting, 0, 5), [0, 1, 3, 2, 0]);
         assert_eq!(flags(&formatting, 3, 3), [2, 0, 0]);
+    }
+
+    #[test]
+    fn lists_quotes_and_code_are_drawn_inside_the_input() {
+        let text = "um\ndois\ncitacao\ncodigo";
+        let mut formatting = ComposerFormatting::default();
+        formatting.toggle_list(text, (0, 2), message_body::ListKind::Ordered);
+        formatting.toggle_list(text, (3, 7), message_body::ListKind::Unordered);
+        formatting.toggle_quote(text, (8, 15));
+        formatting.toggle_code_block(text, (16, 22));
+        let content = shaped(text, formatting, 300.0, 160.0);
+        let geometry = content.geometry.borrow();
+        let geometry = geometry.as_ref().unwrap();
+        assert_eq!(geometry.markers.iter().map(|marker| marker.text.as_str()).collect::<Vec<_>>(), ["1.", "•"]);
+        assert!(geometry.backgrounds.iter().any(|stroke| stroke.color == Ink::QuoteBar && stroke.bounds.x < 0.0));
+        assert!(geometry.backgrounds.iter().any(|stroke| stroke.color == Ink::Code && stroke.bounds.width > 0.0));
     }
 
     #[test]

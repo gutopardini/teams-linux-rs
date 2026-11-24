@@ -312,6 +312,12 @@ fn ensure_call_window(state: &mut TeamsApp) -> Task<AppMessage> {
     open.map(|_| AppMessage::WindowReady)
 }
 
+fn focus_call_window(state: &TeamsApp) -> Task<AppMessage> {
+    state.call_window.map_or_else(Task::none, |id| {
+        iced::window::minimize(id, false).chain(iced::window::gain_focus(id))
+    })
+}
+
 fn focus_main_window(state: &TeamsApp) -> Task<AppMessage> {
     if let Some(id) = state.main_window {
         return iced::window::minimize(id, false).chain(iced::window::gain_focus(id));
@@ -917,14 +923,21 @@ enum AppMessage {
     ApplyDraftMark(message_body::InlineMark),
     ToggleDraftList(message_body::ListKind),
     ToggleDraftCodeBlock,
+    DraftCodeAction { index: usize, action: text_editor::Action },
+    SetDraftCodeLanguage { index: usize, language: message_body::CodeLanguage },
     ToggleDraftQuote,
     InsertDraftTable { rows: usize, columns: usize },
+    EditDraftTableCell { line: usize, column: usize, text: String },
+    EditDraftLine { index: usize, text: String },
     ClearDraftFormatting,
     OpenDraftLink,
     DraftLinkChanged(String),
     DraftLinkTextChanged(String),
     ToggleComposerMenu(composer_ui::Menu),
     CloseComposerMenu,
+    RequestDiscardDraft,
+    CancelDiscardDraft,
+    ConfirmDiscardDraft,
     ClearDraftText,
     ApplyDraftLink,
     CloseDraftLink,
@@ -2208,7 +2221,9 @@ struct TeamsApp {
     draft_store_in_flight: bool,
     draft_selection: Option<(String, usize, usize)>,
     composer_content: crate::composer_decorations::Content,
+    code_editors: Vec<text_editor::Content>,
     formatting_open: bool,
+    draft_discard_for: Option<String>,
     composer_emoji_open: bool,
     emoji_tab: emoji_picker::Tab,
     emoji_query: String,
@@ -2733,9 +2748,13 @@ fn message_popup_style(theme: &Theme) -> container::Style {
 
 fn presence_icon(
     availability: presence::Availability,
+    activity: presence::Activity,
     size: f32,
     appearance: Appearance,
 ) -> Element<'static, AppMessage> {
+    if activity == presence::Activity::Presenting {
+        return presenting_icon(size, appearance);
+    }
     static HANDLES: std::sync::OnceLock<[[svg::Handle; 6]; 2]> = std::sync::OnceLock::new();
     let handles = HANDLES.get_or_init(|| {
         let sources: [&[u8]; 6] = [
@@ -2781,6 +2800,30 @@ fn presence_icon(
     };
     let theme_index = usize::from(appearance == Appearance::Dark);
     svg(handles[theme_index][index].clone())
+        .width(size)
+        .height(size)
+        .into()
+}
+
+/// Presenting keeps a black dash on the red ball. The shared tint would paint
+/// that dash the same red as the circle.
+fn presenting_icon(size: f32, appearance: Appearance) -> Element<'static, AppMessage> {
+    static HANDLES: std::sync::OnceLock<[svg::Handle; 2]> = std::sync::OnceLock::new();
+    let handles = HANDLES.get_or_init(|| {
+        [Appearance::Light, Appearance::Dark].map(|appearance| {
+            let color = tone(&teams_theme(appearance), Tone::PresenceBusy);
+            let css = format!(
+                "#{:02x}{:02x}{:02x}",
+                (color.r * 255.0).round() as u8,
+                (color.g * 255.0).round() as u8,
+                (color.b * 255.0).round() as u8,
+            );
+            let source = String::from_utf8_lossy(include_bytes!("../assets/icons/presence-presenting.svg"))
+                .replace("currentColor", &css);
+            svg::Handle::from_memory(source.into_bytes())
+        })
+    });
+    svg(handles[usize::from(appearance == Appearance::Dark)].clone())
         .width(size)
         .height(size)
         .into()
@@ -3095,16 +3138,27 @@ fn read_receipt_readers(
         let name = names.get(&identity).and_then(|name| sender_names::known(name))
             .or_else(|| (!receipt.user.contains(':')).then(|| sender_names::known(&receipt.user)).flatten())
             .unwrap_or_else(|| tr("Unnamed participant"));
-        for message in &messages[..=frontier] {
-            if message.is_mine && !message.id.is_empty() && !message.id.starts_with("local:") {
-                let entries = readers.entry(message.id.clone()).or_default();
-                if !entries.iter().any(|(id, _)| *id == identity) {
-                    entries.push((identity.clone(), name.to_owned()));
-                }
-            }
+        let Some(message) = messages[..=frontier].iter().rev().find(|message| {
+            message.is_mine
+                && !message.is_deleted
+                && !message.id.is_empty()
+                && !message.id.starts_with("local:")
+        }) else { continue; };
+        let entries = readers.entry(message.id.clone()).or_default();
+        if !entries.iter().any(|(id, _)| *id == identity) {
+            entries.push((identity, name.to_owned()));
         }
     }
     readers.into_iter().map(|(id, entries)| (id, entries.into_iter().map(|(_, name)| name).collect())).collect()
+}
+
+fn delivery_status_message_id(messages: &[GraphMessage]) -> Option<&str> {
+    messages.iter().rev().find(|message| {
+        message.is_mine
+            && !message.is_deleted
+            && !message.id.is_empty()
+            && !message.id.starts_with("local:")
+    }).map(|message| message.id.as_str())
 }
 
 fn outgoing_message_status_marker(readers: &[String]) -> Element<'static, AppMessage> {
@@ -3759,7 +3813,7 @@ impl TeamsApp {
             .filter(|value| value.availability != presence::Availability::Unknown)
         {
             let dot_size = (size * 0.34).clamp(9.0, 13.0);
-            let dot = container(presence_icon(observed.availability, dot_size, self.preferences.appearance))
+            let dot = container(presence_icon(observed.availability, observed.activity, dot_size, self.preferences.appearance))
                 .width(dot_size)
                 .height(dot_size)
                 .style(ui_surface(Tone::Canvas, false, dot_size / 2.0));
@@ -3913,7 +3967,7 @@ impl TeamsApp {
             items = items.push(
                 button(
                     row![
-                        presence_icon(availability, 20.0, self.preferences.appearance),
+                        presence_icon(availability, presence::Activity::Unknown, 20.0, self.preferences.appearance),
                         text(availability.label()).size(14).width(Fill),
                         marker,
                     ]
@@ -4635,35 +4689,39 @@ impl TeamsApp {
         let completion_key = key.clone();
         let completion_id = client_message_id.clone();
         let upload_task = Task::perform(
-            async move {
-                let callback_sender = progress_tx.clone();
-                let upload = graph::upload_file_with_progress(
-                    session,
-                    target,
-                    path,
-                    draft.sha256.clone(),
-                    client_message_id,
-                    verify_first,
-                    move |sent, total| {
-                        let _ = callback_sender.send((sent, total));
-                    },
-                );
-                let cancelled = async move {
-                    loop {
-                        if *cancel_rx.borrow() {
-                            break;
+            background::run_interactive_value(move || match graph::runtime() {
+                Ok(runtime) => runtime.block_on(async move {
+                    let callback_sender = progress_tx.clone();
+                    let upload = graph::upload_file_with_progress(
+                        session,
+                        target,
+                        path,
+                        draft.sha256.clone(),
+                        client_message_id,
+                        verify_first,
+                        move |sent, total| {
+                            let _ = callback_sender.send((sent, total));
+                        },
+                    );
+                    let cancelled = async move {
+                        loop {
+                            if *cancel_rx.borrow() {
+                                break;
+                            }
+                            if cancel_rx.changed().await.is_err() {
+                                break;
+                            }
                         }
-                        if cancel_rx.changed().await.is_err() {
-                            break;
-                        }
+                    };
+                    tokio::select! {
+                        result = upload => DocumentUploadOutcome::Completed(result),
+                        _ = cancelled => DocumentUploadOutcome::Cancelled,
                     }
-                };
-                tokio::select! {
-                    result = upload => DocumentUploadOutcome::Completed(result),
-                    _ = cancelled => DocumentUploadOutcome::Cancelled,
-                }
-            },
+                }),
+                Err(error) => DocumentUploadOutcome::Completed(Err(error)),
+            }),
             move |result| {
+                let result = result.unwrap_or_else(|error| DocumentUploadOutcome::Completed(Err(error)));
                 AppMessage::DocumentUploadFinished(
                     epoch,
                     completion_key.clone(),
@@ -5081,6 +5139,19 @@ impl TeamsApp {
             .unwrap_or_default()
     }
 
+    fn sync_code_editors(&mut self) {
+        let texts = code_block_texts(&self.draft, &self.active_formatting());
+        if self.code_editors.len() != texts.len() {
+            self.code_editors = texts.into_iter().map(|text| text_editor::Content::with_text(&text)).collect();
+            return;
+        }
+        for (editor, text) in self.code_editors.iter_mut().zip(texts) {
+            if editor.text() != text {
+                *editor = text_editor::Content::with_text(&text);
+            }
+        }
+    }
+
     fn undo_snapshot(&self) -> draft_history::Snapshot {
         draft_history::Snapshot { text: self.draft.clone(), formatting: self.active_formatting() }
     }
@@ -5486,7 +5557,9 @@ impl TeamsApp {
             draft_store_in_flight: false,
             draft_selection: None,
             composer_content: crate::composer_decorations::Content::with_text(""),
+            code_editors: Vec::new(),
             formatting_open: false,
+            draft_discard_for: None,
             composer_emoji_open: false,
             emoji_tab: emoji_picker::Tab::default(),
             emoji_query: String::new(),
@@ -6092,7 +6165,6 @@ impl TeamsApp {
                 self.draft_formatting.insert(key.clone(), formatting);
                 self.draft_active_marks.insert(key, HashSet::new());
             }
-            self.draft_preview_open = true;
         }
 
         if std::env::args().any(|arg| arg == "--content-parity-demo") {
@@ -7045,6 +7117,9 @@ impl TeamsApp {
         } else {
             HashMap::new()
         };
+        let delivery_marker = (self.section == Section::Chats)
+            .then(|| delivery_status_message_id(messages))
+            .flatten();
         let unread_marker_index = if self.section == Section::Chats {
             let local_frontier = self
                 .selected_chat
@@ -7482,60 +7557,15 @@ impl TeamsApp {
                 if images::file_preview_url(file).is_some_and(|url| message.images.iter().any(|image| image.url == url)) {
                     continue;
                 }
-                let url = file
-                    .share_url
-                    .as_deref()
-                    .filter(|url| message_body::valid_link(url).is_some())
-                    .or_else(|| {
-                        message_body::valid_link(&file.object_url)
-                            .as_deref()
-                            .map(|_| file.object_url.as_str())
-                    })
-                    .map(str::to_owned);
-                let open = url.clone().map(AppMessage::OpenMessageLink);
-                let mut file_row = row![
-                    file_kind_mark(&file.name),
-                    text(file.name.clone())
-                        .size(13)
-                        .font(semibold())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .style(ui_text(Tone::Text))
-                        .width(Fill),
-                    hint(
-                        button(icon_tone(Icon::External, Tone::Secondary, 16.0))
-                            .padding(6)
-                            .on_press_maybe(open.clone())
-                            .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Secondary, 4.0)),
-                        tr("Open file"),
-                    ),
-                    hint(
-                        button(icon_tone(Icon::More, Tone::Secondary, 16.0))
-                            .padding(6)
-                            .on_press_maybe(open)
-                            .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Secondary, 4.0)),
-                        tr("More file options"),
-                    ),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center);
-                let max_width = if let Some(preview) = images::attachment_thumbnail(file, &message.images) {
+                if let Some(preview) = images::attachment_thumbnail(file, &message.images) {
                     let width = images::FILE_THUMBNAIL_WIDTH.min((content_width - 20.0).max(1.0));
-                    file_row = row![column![
-                        file_row,
+                    body = body.push(column![
+                        file_attachment_card(file, width),
                         message_body::inline_image_view(&preview, &self.media, width),
-                    ]
-                    .spacing(8)]
-                    .align_y(Alignment::Center);
-                    width + 20.0
+                    ].spacing(8));
                 } else {
-                    420.0
-                };
-                body = body.push(
-                    container(file_row)
-                        .max_width(max_width)
-                        .padding([8, 10])
-                        .style(ui_surface(Tone::Canvas, true, 8.0)),
-                );
+                    body = body.push(file_attachment_card(file, (content_width - 20.0).clamp(100.0, 420.0)));
+                }
             }
             }
             let menu_open = self.message_menu_for.as_deref() == Some(message.id.as_str());
@@ -7745,9 +7775,12 @@ impl TeamsApp {
                 && !message.is_deleted
                 && !message.id.starts_with("local:")
             {
-                message_content = message_content.push(outgoing_message_status_marker(
-                    readers.get(&message.id).map(Vec::as_slice).unwrap_or(&[]),
-                ));
+                let message_readers = readers.get(&message.id).map(Vec::as_slice).unwrap_or(&[]);
+                let show_delivered = message_readers.is_empty()
+                    && delivery_marker == Some(message.id.as_str());
+                if !message_readers.is_empty() || show_delivered {
+                    message_content = message_content.push(outgoing_message_status_marker(message_readers));
+                }
             }
             let important = message_priority_label(message.importance).is_some();
             let message_row: Element<'_, AppMessage> = if message.is_mine && self.section == Section::Chats {
@@ -8520,9 +8553,17 @@ impl TeamsApp {
             .padding([12, 10])
             .width(Fill)
             .into()
+        } else if formatting.tables.iter().any(|table| table.start < table.end) || formatting.code_blocks.iter().any(|block| block.start < block.end) {
+            live_table_composer(&self.draft, &formatting, &self.code_editors, u32::from(self.preferences.message_size), editor_limit)
         } else if self.composer_uses_editor() {
-            let settings =
-                message_body::ComposerHighlightSettings::new(&self.draft, formatting.clone());
+            let settings = message_body::ComposerHighlightSettings::new(
+                &self.draft,
+                formatting.clone(),
+                self.preferences.message_size,
+            );
+            let gutter = message_body::composer_gutter(&formatting);
+            let mut editor_padding = iced::Padding::from(if compact { [6, 10] } else { [12, 10] });
+            editor_padding.left += gutter;
             let mut editor = text_editor::TextEditor::new(&self.composer_content)
                 .id(composer_frame::RICH_EDITOR)
                 .placeholder(if quote_compose {
@@ -8531,7 +8572,7 @@ impl TeamsApp {
                     tr("Type a message")
                 })
                 .on_action(AppMessage::DraftAction)
-                .padding(if compact { [6, 10] } else { [12, 10] })
+                .padding(editor_padding)
                 .size(u32::from(self.preferences.message_size))
                 .height(iced::Length::Shrink)
                 .min_height((if self.formatting_open { 104.0 } else { f32::from(self.preferences.message_size) * 1.5 + 24.0 }).min(editor_limit))
@@ -8546,7 +8587,7 @@ impl TeamsApp {
                 editor = editor.key_binding(move |key| settings::composer_key(key, enter_sends));
             }
             let decorated = composer_decorations::view(editor, &self.composer_content, settings,
-                self.preferences.message_size, iced::Padding::from(if compact { [6, 10] } else { [12, 10] }), editor_limit);
+                self.preferences.message_size, editor_padding, editor_limit, gutter);
             paste::rich_composer(decorated, self.draft_key().unwrap_or_default())
         } else {
             let editor = text_input(tr("Type a message"), &self.draft)
@@ -8731,47 +8772,25 @@ impl TeamsApp {
         if self.formatting_open && drafts_ready {
             compose = compose.push(composer_ui::toolbar(self));
         }
-        if self.file_drag_hovered {
-            compose = compose.push(
-                container(
-                    text(tr("Drop images or files to attach them"))
-                        .size(12)
-                        .style(ui_text(Tone::Accent)),
-                )
-                .width(Fill)
-                .padding([7, 10])
-                .style(ui_surface(Tone::Selected, true, 6.0)),
-            );
-        }
         if expanded { compose = compose.push(composer_input.take().unwrap()); }
         if let Some(stage) = self
             .pending_document_stage
             .as_ref()
             .filter(|stage| current_draft_key.as_deref() == Some(stage.draft_key.as_str()))
         {
-            compose = compose.push(
-                container(
-                    row![
-                        icon_tone(Icon::Files, Tone::Accent, 22.0),
-                        column![
-                            text(stage.name.clone())
-                                .size(13)
-                                .font(semibold())
-                                .style(ui_text(Tone::Text)),
-                            text(tr("Preparing attachment in the background"))
-                                .size(11)
-                                .style(ui_text(Tone::Muted)),
-                        ]
-                        .spacing(3)
+            compose = compose.push(composer_file_chip(
+                &stage.name,
+                row![
+                    text(tr("Checking permissions…"))
+                        .size(12)
+                        .style(ui_text(Tone::Text))
                         .width(Fill),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                )
-                .width(Fill)
-                .padding([9, 10])
-                .style(ui_surface(Tone::Canvas, true, 6.0)),
-            );
+                    permission_spinner(),
+                ]
+                .align_y(Alignment::Center)
+                .into(),
+                None,
+            ));
         }
         if let Some((key, file)) = self
             .draft_key()
@@ -8781,145 +8800,56 @@ impl TeamsApp {
                 .document_upload
                 .as_ref()
                 .filter(|upload| upload.draft_key == key && upload.epoch == self.session_epoch);
-            let remove = button(text(tr("Remove")).size(11))
-                .padding([4, 7])
-                .on_press_maybe(upload.is_none().then_some(AppMessage::RemoveDocumentAttachment))
-                .style(ui_button(
-                    Tone::Transparent,
-                    Tone::Hover,
-                    Tone::Secondary,
-                    4.0,
-                ));
-            let action: Element<'_, AppMessage> = if let Some(upload) = upload {
-                button(
-                    text(if upload.cancel_requested {
-                        "Cancelando…"
-                    } else {
-                        tr("Cancel")
-                    })
-                    .size(11),
-                )
-                    .padding([4, 7])
-                    .on_press_maybe(
-                        (!upload.cancel_requested).then_some(AppMessage::CancelDocumentUpload),
-                    )
-                    .style(ui_button(
-                        Tone::Transparent,
-                        Tone::Hover,
-                        Tone::Secondary,
-                        4.0,
-                    ))
-                    .into()
-            } else {
-                remove.into()
-            };
-            let mut details = column![
-                text(file.name.clone())
-                    .size(13)
-                    .font(semibold())
-                    .style(ui_text(Tone::Text)),
-                text(format!("Arquivo · {:.1} MB", file.size as f64 / 1_048_576.0))
-                    .size(11)
-                    .style(ui_text(Tone::Muted)),
-            ]
-            .spacing(3)
-            .width(Fill);
-            if let Some(upload) = upload {
+            let (body, dismiss): (Element<'_, AppMessage>, Option<AppMessage>) = if let Some(upload) = upload {
                 let percent = if upload.total == 0 {
                     100
                 } else {
                     (upload.sent.saturating_mul(100) / upload.total).min(100)
                 };
-                details = details.push(
-                    text(format!(
-                        "Sending · {percent}% · {} / {} KB",
-                        upload.sent / 1024,
-                        upload.total / 1024
-                    ))
-                    .size(11)
-                    .style(ui_text(Tone::Accent)),
-                );
                 let ratio = if upload.total == 0 {
                     1.0
                 } else {
                     (upload.sent as f32 / upload.total as f32).clamp(0.0, 1.0)
                 };
-                details = details.push(
-                    progress_bar(0.0..=1.0, ratio)
-                        .girth(5)
-                        .style(|theme| iced::widget::progress_bar::Style {
-                            background: Background::Color(tone(theme, Tone::Border)),
-                            bar: Background::Color(tone(theme, Tone::Accent)),
-                            border: Border::default().rounded(3.0),
-                        }),
-                );
-            } else if !self.draft.trim().is_empty() {
-                details = details.push(
-                    text(tr("Clear the text to send the file separately."))
-                        .size(11)
-                        .style(ui_text(Tone::Secondary)),
-                );
-            } else {
-                details = details.push(
-                    text(tr("The file will be sent when you select Send."))
-                        .size(11)
-                        .style(ui_text(Tone::Muted)),
-                );
-            }
-            compose = compose.push(
-                container(
-                    row![
-                        icon_tone(Icon::Files, Tone::Accent, 22.0),
-                        details,
-                        action,
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                )
-                .width(Fill)
-                .padding([9, 10])
-                .style(ui_surface(Tone::Canvas, true, 6.0)),
-            );
-        }
-        if self.formatting_open && self.draft_preview_open && !self.draft.trim().is_empty() {
-            let current_document = message_body::Document::from_editor(&self.draft, &formatting);
-            let preview_theme = teams_theme(self.preferences.appearance);
-            let preview_document = message_body::view_with_media(
-                Some(&current_document),
-                "",
-                &self.preferences,
-                &preview_theme,
-                true,
-                &self.media,
-                (width - 48.0).clamp(240.0, 840.0),
-                None,
-            );
-            let preview_height = if current_document
-                .blocks
-                .iter()
-                .any(|block| block.table.is_some())
-            {
-                260.0
-            } else {
-                120.0
-            };
-            compose = compose.push(
-                container(
+                (
                     column![
-                        text(tr("Preview message"))
-                            .size(12)
-                            .font(semibold())
-                            .style(ui_text(Tone::Secondary)),
-                        scrollable(preview_document)
-                            .height(preview_height)
-                            .style(ui_scroll),
+                        text(format!(
+                            "Sending · {percent}% · {} / {} KB",
+                            upload.sent / 1024,
+                            upload.total / 1024
+                        ))
+                        .size(12)
+                        .style(ui_text(Tone::Text)),
+                        progress_bar(0.0..=1.0, ratio)
+                            .girth(5)
+                            .style(|theme| iced::widget::progress_bar::Style {
+                                background: Background::Color(tone(theme, Tone::Border)),
+                                bar: Background::Color(tone(theme, Tone::Accent)),
+                                border: Border::default().rounded(3.0),
+                            }),
                     ]
-                    .spacing(6),
+                    .spacing(6)
+                    .into(),
+                    (!upload.cancel_requested).then_some(AppMessage::CancelDocumentUpload),
                 )
-                .padding(10)
-                .width(Fill)
-                .style(ui_surface(Tone::Canvas, true, 6.0)),
-            );
+            } else if !self.draft.trim().is_empty() {
+                (
+                    text(tr("Clear the text to send the file separately."))
+                        .size(12)
+                        .style(ui_text(Tone::Secondary))
+                        .into(),
+                    Some(AppMessage::RemoveDocumentAttachment),
+                )
+            } else {
+                (
+                    text(tr("The file will be sent when you select Send."))
+                        .size(12)
+                        .style(ui_text(Tone::Muted))
+                        .into(),
+                    Some(AppMessage::RemoveDocumentAttachment),
+                )
+            };
+            compose = compose.push(composer_file_chip(&file.name, body, dismiss));
         }
         if let Some(pictures) = pictures.filter(|pictures| !pictures.is_empty()) {
             let mut previews = row![].spacing(12);
@@ -9330,14 +9260,23 @@ impl TeamsApp {
         {
             content = content.push(meeting_tab_placeholder(self.active_conversation_surface()));
         } else {
-            content = content.push(history);
-            content = content.push(
+            let transcript = column![
+                history,
                 container(composer)
                     .width(Fill).center_x(Fill)
                     .padding(if compact { iced::Padding::from([8, 12]) } else {
                         iced::Padding { top: 16.0, right: 24.0, bottom: 24.0, left: 24.0 }
                     }),
-            );
+            ]
+            .spacing(0)
+            .width(Fill)
+            .height(Fill);
+            let transcript: Element<'_, AppMessage> = if self.file_drag_hovered && self.draft_key().is_some() {
+                stack![transcript, share_in_chat_overlay()].width(Fill).height(Fill).into()
+            } else {
+                transcript.into()
+            };
+            content = content.push(transcript);
         }
         if !self.status.is_empty() {
             content = content.push(
@@ -10834,7 +10773,11 @@ fn apply_trouter_event(state: &mut TeamsApp, event: ost::event_hub::TrouterEvent
             }
         }
         ost::event_hub::TrouterEventKind::CallInvitation => {
-            let Some(notice) = incoming_call_notice(&event.payload_json) else {
+            if state.native_call.is_none() {
+                live_trace::record("incoming_call_route", 0, call_route_class(&event.payload_json), 1);
+            }
+            let Some(notice) = incoming_call_notice(&event.payload_json, state.user_id.as_str()) else {
+                live_trace::record("incoming_call_notice", 0, 0, 0);
                 return;
             };
             if !remember_incoming_call_id(state, &notice.id) {
@@ -10861,7 +10804,12 @@ fn apply_trouter_event(state: &mut TeamsApp, event: ost::event_hub::TrouterEvent
             }
         }
         ost::event_hub::TrouterEventKind::Unclassified => {}
-        ost::event_hub::TrouterEventKind::CallSignal => state.call_hub.handle_event(event),
+        ost::event_hub::TrouterEventKind::CallSignal => {
+            if state.native_call.is_none() {
+                live_trace::record("incoming_call_route", 0, call_route_class(&event.payload_json), 0);
+            }
+            state.call_hub.handle_event(event);
+        }
     }
 }
 
@@ -10937,9 +10885,35 @@ fn remember_incoming_call_id(state: &mut TeamsApp, id: &str) -> bool {
     true
 }
 
-fn incoming_call_notice(payload_json: &str) -> Option<IncomingCallNotice> {
-    let notification = ost::calling::parse_call_notification(payload_json)?;
-    let invitation = notification.call_invitation.as_ref()?;
+fn call_route_class(payload: &str) -> usize {
+    let lower = payload.to_ascii_lowercase();
+    if lower.contains("ngcallmanager") {
+        2
+    } else if lower.contains("callagent") {
+        1
+    } else {
+        0
+    }
+}
+
+fn same_person(own_id: &str, other_id: &str) -> bool {
+    let own_id = own_id.trim();
+    let other_id = other_id.trim();
+    !own_id.is_empty()
+        && (own_id.eq_ignore_ascii_case(other_id)
+            || other_id.rsplit(':').next().is_some_and(|tail| tail.eq_ignore_ascii_case(own_id)))
+}
+
+fn incoming_call_notice(payload_json: &str, own_id: &str) -> Option<IncomingCallNotice> {
+    let Some(notification) = ost::calling::parse_call_notification(payload_json) else {
+        return generic_incoming_call_notice(payload_json);
+    };
+    if notification.participants.as_ref().and_then(|people| people.from.as_ref()).and_then(|person| person.id.as_deref()).is_some_and(|id| same_person(own_id, id)) {
+        return None;
+    }
+    let Some(invitation) = notification.call_invitation.as_ref() else {
+        return generic_incoming_call_notice(payload_json);
+    };
     let is_video = invitation.call_modalities.as_ref().is_some_and(|modalities| {
         modalities.iter().any(|modality| modality.eq_ignore_ascii_case("video"))
     });
@@ -10950,7 +10924,7 @@ fn incoming_call_notice(payload_json: &str) -> Option<IncomingCallNotice> {
         .and_then(|participant| participant.display_name.as_deref())
         .filter(|name| !name.trim().is_empty())
         .map(|name| preview_line(name, 64))
-        .unwrap_or_else(|| "Contato desconhecido".to_owned());
+        .unwrap_or_else(|| tr("Unknown contact").into());
 
     let call_id = notification
         .debug_content
@@ -10972,6 +10946,20 @@ fn incoming_call_notice(payload_json: &str) -> Option<IncomingCallNotice> {
         )
     });
     Some(IncomingCallNotice { id, caller_name, is_video, alert_visible: true })
+}
+
+fn generic_incoming_call_notice(payload_json: &str) -> Option<IncomingCallNotice> {
+    let digest = sha2::Sha256::digest(payload_json.as_bytes());
+    let id = format!(
+        "notice-{}",
+        digest.iter().take(12).map(|byte| format!("{byte:02x}")).collect::<String>()
+    );
+    Some(IncomingCallNotice {
+        id,
+        caller_name: tr("Unknown contact").into(),
+        is_video: false,
+        alert_visible: true,
+    })
 }
 
 fn scroll_to_latest() -> Task<AppMessage> {
@@ -11093,10 +11081,10 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         | AppMessage::MentionNavigate(_) | AppMessage::MentionPick(_) | AppMessage::MentionAccept | AppMessage::MentionMembersLoaded(..) | AppMessage::CloseMentions | AppMessage::RetryMentions
         | AppMessage::DraftSelectionChanged(_, _) | AppMessage::DraftFontSizeSelected(_)
         | AppMessage::DraftTextColorSelected(_) | AppMessage::DraftHighlightSelected(_) | AppMessage::ClearDraftHighlight | AppMessage::ApplyDraftMark(_)
-        | AppMessage::ToggleDraftList(_) | AppMessage::ToggleDraftCodeBlock | AppMessage::ToggleDraftQuote | AppMessage::InsertDraftTable { .. } | AppMessage::ClearDraftFormatting
+        | AppMessage::ToggleDraftList(_) | AppMessage::ToggleDraftCodeBlock | AppMessage::DraftCodeAction { .. } | AppMessage::SetDraftCodeLanguage { .. } | AppMessage::ToggleDraftQuote | AppMessage::InsertDraftTable { .. } | AppMessage::ClearDraftFormatting
         | AppMessage::ToggleFormatting | AppMessage::ToggleDraftPreview
         | AppMessage::ToggleComposerEmoji | AppMessage::InsertComposerEmoji(_) | AppMessage::EmojiTabSelected(_) | AppMessage::EmojiSearchChanged(_) | AppMessage::EmojiCategorySelected(_)
-        | AppMessage::ToggleComposerMenu(_) | AppMessage::CloseComposerMenu | AppMessage::ClearDraftText
+        | AppMessage::ToggleComposerMenu(_) | AppMessage::CloseComposerMenu | AppMessage::RequestDiscardDraft | AppMessage::CancelDiscardDraft | AppMessage::ConfirmDiscardDraft | AppMessage::ClearDraftText
         | AppMessage::OpenDraftLink | AppMessage::DraftLinkChanged(_) | AppMessage::DraftLinkTextChanged(_)
         | AppMessage::ApplyDraftLink | AppMessage::CloseDraftLink
         | AppMessage::TypingIndicatorSent | AppMessage::DraftSaveReady(_, _)
@@ -11153,6 +11141,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         | AppMessage::ApplyDraftLink).then(|| (state.draft_key(), state.undo_snapshot()));
     let refresh_draft_rows=state.chat_list_filter==ChatListFilter::Drafts&&matches!(&message,AppMessage::DraftChanged(_)|AppMessage::DraftAction(_));
     let task = update_inner(state, message);
+    state.sync_code_editors();
     if let Some((Some(key), before)) = format_history
         && state.draft_key().as_deref() == Some(key.as_str())
         && state.undo_snapshot() != before
@@ -11232,20 +11221,30 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.save_preferences()
         }
         AppMessage::CloseMainWindow(id) => {
-            if state.closing_window{return Task::none();}state.closing_window=true;
-            let done=state.native_call.as_ref().map(|call|{call.cancel();call.changes()});
-            let wait=if done.is_some(){Duration::from_secs(25)}else{Duration::from_secs(2)};
-            state.prejoin=None;
-            let endpoint=state.automatic_presence.stop();let session=state.session.clone();
-            let cleanup = Task::perform(async move{
-                let work=async move{
-                    if let Some(done)=done{native_call::Client::completed(done).await;}
-                    if let Some(session)=session{let _=desktop_presence::stop(session,endpoint).await;}
+            if state.closing_window { return Task::none(); }
+            state.closing_window = true;
+            if let Some(call) = state.native_call.as_ref() { call.cancel(); }
+            state.prejoin = None;
+            let endpoint = state.automatic_presence.stop();
+            let session = state.session.clone();
+            let close_call = state
+                .call_window
+                .take()
+                .map(iced::window::close)
+                .unwrap_or_else(Task::none);
+            // The call worker can sit inside screen share after cancel. Waiting
+            // for it kept the window on screen and ignored the next close click.
+            let cleanup = Task::perform(async move {
+                let work = async move {
+                    if let Some(session) = session {
+                        let _ = desktop_presence::stop(session, endpoint).await;
+                    }
                 };
-                let deadline=futures_timer::Delay::new(wait);iced::futures::pin_mut!(work,deadline);
-                let _=iced::futures::future::select(work,deadline).await;
-            },move |_|AppMessage::CloseMainWindowReady(id));
-            iced::window::minimize(id, true).chain(cleanup)
+                let deadline = futures_timer::Delay::new(Duration::from_secs(2));
+                iced::futures::pin_mut!(work, deadline);
+                let _ = iced::futures::future::select(work, deadline).await;
+            }, move |_| AppMessage::CloseMainWindowReady(id));
+            close_call.chain(iced::window::close(id)).chain(cleanup)
         }
         AppMessage::CloseMainWindowReady(id) => {
             let close_call = state
@@ -12804,7 +12803,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.image_file_picker_open = true;
             let epoch = state.session_epoch;
             Task::perform(
-                async move { images::choose_attachment_path() },
+                background::run(move || images::choose_attachment_path()),
                 move |result| AppMessage::AttachmentFileSelected(epoch, key, result),
             )
         }
@@ -15544,14 +15543,17 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                     // Keep PCM gated until the coordinator confirms an unmute.
                     // The watch command survives setup and applies on connection.
                     client.set_muted(join.microphone_muted);
-                    state.native_call_snapshot=Some(client.snapshot());state.native_call=Some(client);native_call_watch(state)
+                    state.native_call_snapshot=Some(client.snapshot());state.native_call=Some(client);
+                    Task::batch([native_call_watch(state), focus_call_window(state)])
                 },
                 Err(fault)=>{call_diagnostics::fault(fault);join.error=Some(fault.message().into());Task::none()}
             }
         }
         AppMessage::NativeCallPulse(epoch,key) => {
             if epoch!=state.session_epoch || !state.native_call.as_ref().is_some_and(|call|call.key==key){return Task::none();}
+            let previous_phase = state.native_call_snapshot.as_ref().map(|snapshot| snapshot.phase);
             let snapshot=state.native_call.as_mut().unwrap().snapshot();
+            let phase_changed = previous_phase != Some(snapshot.phase);
             if let Some(cue)=state.call_cues.observe(snapshot.phase) {
                 if !state.demo_mode && state.preferences.alerts.meeting_sounds {state.event_sounds.play(cue);}
             }
@@ -15572,6 +15574,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.native_call_snapshot=Some(snapshot);
             if terminal {
                 update_inner(state, AppMessage::CloseMeeting)
+            } else if phase_changed {
+                Task::batch([native_call_watch(state), focus_call_window(state)])
             } else {
                 native_call_watch(state)
             }
@@ -15817,6 +15821,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             Task::batch(tasks)
         }
         AppMessage::SelectConversation(chat_id) => {
+            state.draft_discard_for = None;
             let group=state.chats.iter().any(|c|c.id==chat_id&&c.is_group);
             state.mention_composer.context(Some(chat_id.clone()),group);
             state.desktop_message_notices.close_chat(&chat_id);
@@ -17938,11 +17943,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::ToggleDraftPreview => {
             state.composer_menu = None;
-            if !state.formatting_open || state.draft.trim().is_empty() {
-                return Task::none();
-            }
-            state.draft_preview_open = !state.draft_preview_open;
-            iced::widget::operation::focus("message-composer-rich")
+            state.draft_preview_open = false;
+            Task::none()
         }
         AppMessage::ApplyDraftMark(mark) => {
             state.composer_menu = None;
@@ -18081,13 +18083,53 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.composer_menu = None;
             let Some(key) = state.draft_key() else { return Task::none(); };
             let selection = state.selected_draft_range().unwrap_or_else(|| message_body::editor_cursor_range(&state.draft, state.composer_content.cursor()));
+            let line = unicode_segmentation::UnicodeSegmentation::graphemes(state.draft.as_str(), true)
+                .take(selection.0)
+                .filter(|grapheme| *grapheme == "\n")
+                .count();
+            let closing = state.draft_formatting.get(&key).is_some_and(|formatting| formatting.has_code_block(&state.draft, selection));
             state
                 .draft_formatting
-                .entry(key)
+                .entry(key.clone())
                 .or_default()
                 .toggle_code_block(&state.draft, selection);
             state.mark_drafts_dirty();
-            state.restore_composer_selection(selection)
+            if closing {
+                state.restore_composer_selection(selection)
+            } else {
+                let index = state.draft_formatting.get(&key).and_then(|formatting| {
+                    formatting.code_blocks.iter().position(|block| line >= block.start && line < block.end)
+                }).unwrap_or(0);
+                iced::widget::operation::focus(format!("draft-code-{index}"))
+            }
+        }
+        AppMessage::DraftCodeAction { index, action } => {
+            let Some(editor) = state.code_editors.get_mut(index) else { return Task::none(); };
+            if !action.is_edit() {
+                editor.perform(action);
+                return Task::none();
+            }
+            editor.perform(action);
+            let text = editor.text();
+            let Some(block) = state.active_formatting().code_blocks.get(index).cloned() else { return Task::none(); };
+            let next = replace_draft_span(&state.draft, block.start, block.end, &text);
+            if next == state.draft { return Task::none(); }
+            let task = update_inner(state, AppMessage::DraftChanged(next));
+            state.composer_content = crate::composer_decorations::Content::with_text(&state.draft);
+            task
+        }
+        AppMessage::SetDraftCodeLanguage { index, language } => {
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            let id = language.id();
+            let current = state.draft_formatting.get(&key).and_then(|formatting| formatting.code_blocks.get(index)).map(|block| block.language.clone());
+            if current.as_deref() == Some(id) { return Task::none(); }
+            state.record_draft_undo();
+            if let Some(block) = state.draft_formatting.get_mut(&key).and_then(|formatting| formatting.code_blocks.get_mut(index)) {
+                block.language = id.to_owned();
+            }
+            state.remember_draft();
+            state.mark_drafts_dirty();
+            Task::none()
         }
         AppMessage::ToggleDraftQuote => {
             state.composer_menu = None;
@@ -18120,7 +18162,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 return Task::none();
             };
             state.composer_menu = None;
-            state.draft_preview_open = true;
+            state.draft_preview_open = false;
             state.composer_content = crate::composer_decorations::Content::with_text(&next);
             state
                 .composer_content
@@ -18140,7 +18182,27 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                 .insert_table(line_start, rows, columns);
             state.draft_selection = None;
             state.mark_drafts_dirty();
-            Task::batch([edit, iced::widget::operation::focus("message-composer-rich")])
+            Task::batch([edit, iced::widget::operation::focus("draft-table-0-0")])
+        }
+        AppMessage::EditDraftTableCell { line, column, text } => {
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            let Some(table) = state.draft_formatting.get(&key).and_then(|formatting| {
+                formatting.tables.iter().find(|table| line >= table.start && line < table.end).cloned()
+            }) else {
+                return Task::none();
+            };
+            let Some(next) = replace_draft_table_cell(&state.draft, line, column, usize::from(table.columns), &text) else {
+                return Task::none();
+            };
+            apply_draft_text_keeping_tables(state, key, next)
+        }
+        AppMessage::EditDraftLine { index, text } => {
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            if state.draft_formatting.get(&key).is_some_and(|formatting| formatting.tables.iter().any(|table| index >= table.start && index < table.end)) {
+                return Task::none();
+            }
+            let Some(next) = replace_draft_line(&state.draft, index, &text) else { return Task::none(); };
+            apply_draft_text_keeping_tables(state, key, next)
         }
         AppMessage::ClearDraftFormatting => {
             state.composer_menu = None;
@@ -18182,6 +18244,28 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.composer_menu = None;
             if state.link_editor_open { composer_ui::close_link(state) }
             else { state.restore_composer_selection(state.selected_draft_range().unwrap_or((0, 0))) }
+        }
+        AppMessage::RequestDiscardDraft => {
+            if !state.formatting_open || !(state.drafts_loaded || state.demo_mode) {
+                return Task::none();
+            }
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            state.composer_menu = None;
+            state.link_editor_open = false;
+            state.composer_emoji_open = false;
+            state.draft_discard_for = Some(key);
+            Task::none()
+        }
+        AppMessage::CancelDiscardDraft => {
+            state.draft_discard_for = None;
+            Task::none()
+        }
+        AppMessage::ConfirmDiscardDraft => {
+            let Some(key) = state.draft_discard_for.take() else { return Task::none(); };
+            if state.draft_key().as_deref() != Some(key.as_str()) {
+                return Task::none();
+            }
+            update_inner(state, AppMessage::ClearDraftText)
         }
         AppMessage::ClearDraftText => {
             let Some(key) = state.draft_key() else { return Task::none(); };
@@ -18486,11 +18570,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             });
             Task::none()
         },
-        AppMessage::FocusCallWindow => {
-            state.call_window.map_or_else(Task::none, |id| {
-                iced::window::minimize(id, false).chain(iced::window::gain_focus(id))
-            })
-        }
+        AppMessage::FocusCallWindow => focus_call_window(state),
         AppMessage::TypingPulse => {
             state.typing_pulse = state.typing_pulse.wrapping_add(1);
             state.typing_indicators.prune_expired(Instant::now());
@@ -19300,7 +19380,12 @@ fn profile_menu_view(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMessa
         let note_exists = own.as_ref().and_then(|value| value.status_note.as_ref()).is_some();
         let actions = column![
             profile_menu_action(
-                presence_icon(availability, 20.0, state.preferences.appearance),
+                presence_icon(
+                    availability,
+                    own.as_ref().map_or(presence::Activity::Unknown, |value| value.activity),
+                    20.0,
+                    state.preferences.appearance,
+                ),
                 availability_label,
                 Some(AppMessage::OpenProfilePresence),
             ),
@@ -19701,7 +19786,7 @@ fn group_people_popover_view(state: &TeamsApp) -> Element<'_, AppMessage> {
             if let Some(status) = presence {
                 details = details.push(
                     row![
-                        presence_icon(status.availability, 10.0, state.preferences.appearance),
+                        presence_icon(status.availability, status.activity, 10.0, state.preferences.appearance),
                         text(status.label()).size(12).style(ui_text(Tone::Secondary)),
                     ]
                     .spacing(5)
@@ -19876,7 +19961,7 @@ fn group_details_view(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMess
             if let Some(observed) = presence_value {
                 identity = identity.push(
                     row![
-                        presence_icon(observed.availability, 11.0, state.preferences.appearance),
+                        presence_icon(observed.availability, observed.activity, 11.0, state.preferences.appearance),
                         text(observed.label()).size(12).style(ui_text(Tone::Secondary)),
                     ]
                     .spacing(5)
@@ -20251,7 +20336,7 @@ fn image_viewer_view(state: &TeamsApp, size: iced::Size) -> Element<'_, AppMessa
 fn view(state: &TeamsApp, window: iced::window::Id) -> Element<'_, AppMessage> {
     live_trace::span("view", || {
         if state.call_window == Some(window) {
-            meeting::view(state)
+            container(meeting::view(state)).width(Fill).height(Fill).into()
         } else {
             view_impl(state)
         }
@@ -20268,22 +20353,46 @@ fn conversation_overlay<'a>(
 }
 
 fn call_window_banner(state: &TeamsApp) -> Element<'_, AppMessage> {
-    if state.call_window.is_none() {
+    if state.call_window.is_none() && state.native_call.is_none() {
         return space::vertical().height(0).into();
     }
+    let direct = state.prejoin.as_ref().is_some_and(|join| {
+        join.chat_target.as_ref().is_some_and(|target| target.callee().is_some())
+    });
+    let status = state
+        .native_call_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.phase.status(direct))
+        .unwrap_or(tr("Call"));
     let subject = state
         .prejoin
         .as_ref()
         .map(|join| join.subject.trim())
         .filter(|subject| !subject.is_empty())
         .unwrap_or(tr("The call"));
-    container(row![
+    let mut actions = row![
         icon_tone(Icon::Calls, Tone::OnPrimary, 18.0),
-        text(format!("{subject} is in the other window.")).size(14).color(Color::WHITE).width(Fill),
-        button(text(tr("Show")).size(13).font(semibold())).padding([6, 12])
-            .on_press(AppMessage::FocusCallWindow)
-            .style(ui_button(Tone::Primary, Tone::SelectedHover, Tone::OnPrimary, 4.0)),
-    ].spacing(10).align_y(Alignment::Center))
+        column![
+            text(status).size(13).font(semibold()).color(Color::WHITE),
+            text(subject).size(12).color(Color::WHITE),
+        ].spacing(1).width(Fill),
+    ].spacing(10).align_y(Alignment::Center);
+    if state.call_window.is_some() {
+        actions = actions.push(
+            button(text(tr("Show")).size(13).font(semibold())).padding([6, 12])
+                .on_press(AppMessage::FocusCallWindow)
+                .style(ui_button(Tone::Primary, Tone::SelectedHover, Tone::OnPrimary, 4.0)),
+        );
+    }
+    if state.native_call.is_some() {
+        let label = if direct { tr("Hang up") } else { tr("Leave") };
+        actions = actions.push(
+            button(text(label).size(13).font(semibold())).padding([6, 12])
+                .on_press(AppMessage::LeaveNativeMeeting)
+                .style(ui_button(Tone::Danger, Tone::SelectedHover, Tone::OnPrimary, 4.0)),
+        );
+    }
+    container(actions)
     .width(Fill)
     .padding([6, 14])
     .style(|_| iced::widget::container::Style {
@@ -20336,6 +20445,135 @@ fn direct_chat_tabs() -> [&'static str; 5] {
     ["Chat", tr("Shared"), tr("Notes"), tr("Recap"), "+"]
 }
 
+fn permission_spinner() -> Element<'static, AppMessage> {
+    svg(svg::Handle::from_memory(
+        include_bytes!("../assets/icons/startup-spinner.svg").as_slice(),
+    ))
+    .width(16)
+    .height(16)
+    .into()
+}
+
+fn composer_file_chip<'a>(
+    name: &str,
+    body: Element<'a, AppMessage>,
+    dismiss: Option<AppMessage>,
+) -> Element<'a, AppMessage> {
+    let close = button(text("×").size(18))
+        .padding([2, 6])
+        .on_press_maybe(dismiss)
+        .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Secondary, 6.0));
+    container(column![
+        row![
+            file_kind_mark(name),
+            text(name.to_owned())
+                .size(13)
+                .font(semibold())
+                .style(ui_text(Tone::Text))
+                .width(Fill),
+            close,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        container(body)
+            .width(Fill)
+            .padding([6, 10])
+            .style(ui_surface(Tone::Canvas, false, 6.0)),
+    ]
+    .spacing(8))
+    .padding(8)
+    .width(Fill)
+    .style(ui_surface(Tone::Surface, true, 8.0))
+    .into()
+}
+
+fn discard_draft_dialog() -> Element<'static, AppMessage> {
+    let close = button(text("×").size(18))
+        .padding([2, 6])
+        .on_press(AppMessage::CancelDiscardDraft)
+        .style(ui_button(Tone::Transparent, Tone::Hover, Tone::Secondary, 6.0));
+    let cancel = button(text(tr("Cancel")).size(14))
+        .padding([8, 16])
+        .on_press(AppMessage::CancelDiscardDraft)
+        .style(|theme, status| {
+            let mut style = ui_button(Tone::Surface, Tone::Hover, Tone::Text, 4.0)(theme, status);
+            style.border = Border::default().rounded(4.0).width(1.0).color(tone(theme, Tone::Border));
+            style
+        });
+    let discard = button(text(tr("Discard")).size(14))
+        .padding([8, 16])
+        .on_press(AppMessage::ConfirmDiscardDraft)
+        .style(ui_button(Tone::Primary, Tone::SelectedHover, Tone::OnPrimary, 4.0));
+    let card = container(column![
+        row![
+            text(tr("Discard draft")).size(18).font(semibold()).style(ui_text(Tone::Text)).width(Fill),
+            close,
+        ].align_y(Alignment::Center),
+        text(tr("You can discard your draft or cancel to keep editing."))
+            .size(13)
+            .style(ui_text(Tone::Secondary)),
+        row![space::horizontal(), cancel, discard].spacing(8).align_y(Alignment::Center),
+    ].spacing(16))
+        .width(460)
+        .padding(20)
+        .style(ui_surface(Tone::Surface, true, 8.0));
+    let dimmer = mouse_area(
+        container(space::vertical()).width(Fill).height(Fill).style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
+            ..container::Style::default()
+        }),
+    )
+    .on_press(AppMessage::CancelDiscardDraft);
+    stack![
+        dimmer,
+        container(card).width(Fill).height(Fill).center_x(Fill).center_y(Fill),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+fn share_in_chat_overlay() -> Element<'static, AppMessage> {
+    let brand = svg(svg::Handle::from_memory(
+        include_bytes!("../assets/teams-linux-rs.svg").to_vec(),
+    ))
+    .width(64)
+    .height(64);
+    let card = column![
+        brand,
+        text(tr("Share in this chat"))
+            .size(22)
+            .font(semibold())
+            .style(ui_text(Tone::Text)),
+        container(icon_tone(Icon::Description, Tone::Accent, 28.0))
+            .width(48)
+            .height(56)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .style(|_| container::Style {
+                background: Some(Background::Color(rgb(0xf5c518))),
+                border: Border::default().rounded(6.0),
+                ..Default::default()
+            }),
+    ]
+    .spacing(18)
+    .align_x(Alignment::Center);
+    let dimmer = container(space::vertical())
+        .width(Fill)
+        .height(Fill)
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.62))),
+            ..container::Style::default()
+        });
+    stack![
+        dimmer,
+        container(card).width(Fill).height(Fill).center_x(Fill).center_y(Fill),
+    ]
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
 fn file_kind_mark(name: &str) -> Element<'static, AppMessage> {
     let extension = name
         .rsplit_once('.')
@@ -20367,6 +20605,35 @@ fn file_kind_mark(name: &str) -> Element<'static, AppMessage> {
     .into()
 }
 
+fn file_attachment_card(file: &ost::api::ChatFileRef, width: f32) -> Element<'static, AppMessage> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let name = file.name.clone();
+    let chars: Vec<&str> = name.graphemes(true).collect();
+    let label = if chars.len() > 36 {
+        let extension = name.rsplit_once('.').map(|(_, ext)| ext)
+            .filter(|ext| ext.len() <= 8).map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        format!("{}…{}", chars.iter().take(28).copied().collect::<String>(), extension)
+    } else { name.clone() };
+    let open = file.share_url.as_deref().and_then(message_body::valid_link)
+        .or_else(|| message_body::valid_link(&file.object_url))
+        .map(AppMessage::OpenMessageLink);
+    let content = row![
+        file_kind_mark(&name),
+        container(text(label).size(13).font(semibold())
+            .wrapping(iced::widget::text::Wrapping::None).style(ui_text(Tone::Text)))
+            .width(Fill).clip(true),
+        icon_tone(Icon::External, Tone::Secondary, 16.0),
+    ].spacing(8).align_y(Alignment::Center).width(Fill);
+    let card = button(content).width(width).padding([8, 10]).on_press_maybe(open)
+        .style(|theme, status| {
+            let mut style = ui_button(Tone::Canvas, Tone::Hover, Tone::Text, 8.0)(theme, status);
+            style.border = Border::default().rounded(8.0).width(1.0).color(tone(theme, Tone::Border));
+            style
+        });
+    hint(card, name)
+}
+
 fn composer_send_separator() -> Element<'static, AppMessage> {
     container(space::vertical())
         .width(1)
@@ -20393,9 +20660,8 @@ fn insert_composer_text(draft: &str, selection: Option<(usize, usize)>, insertio
     (next, cursor)
 }
 
-/// Insert an editable tab-separated table while keeping it on complete editor
-/// lines. The native editor still owns the text; `TableRange` is the semantic
-/// decoration that turns those lines into a table when the message is sent.
+/// Insert a table as consecutive tab-separated lines. The composer draws those
+/// lines as a live grid; `TableRange` is what turns them into a table on send.
 fn insert_composer_table(
     draft: &str,
     selection: Option<(usize, usize)>,
@@ -20430,6 +20696,270 @@ fn insert_composer_table(
     let table_start = start + prefix_len;
     let table_end = table_start + table_len;
     Some((next, table_end, table_start, table_end))
+}
+
+fn apply_draft_text_keeping_tables(state: &mut TeamsApp, key: String, next: String) -> Task<AppMessage> {
+    if next == state.draft {
+        return Task::none();
+    }
+    let tables = state
+        .draft_formatting
+        .get(&key)
+        .map(|formatting| formatting.tables.clone())
+        .unwrap_or_default();
+    state.record_draft_undo();
+    let previous = std::mem::replace(&mut state.draft, next);
+    if let Some(formatting) = state.draft_formatting.get_mut(&key) {
+        formatting.adjust_after_edit(&previous, &state.draft);
+        formatting.tables = tables;
+    }
+    state.composer_content = crate::composer_decorations::Content::with_text(&state.draft);
+    let revision = state.draft_versions.entry(key).or_insert(0);
+    *revision = revision.wrapping_add(1);
+    state.remember_draft();
+    state.mark_drafts_dirty();
+    state.typing_indicator_task()
+}
+
+fn replace_draft_line(draft: &str, index: usize, text: &str) -> Option<String> {
+    let text = single_editor_line(text);
+    let mut lines: Vec<String> = draft.split('\n').map(str::to_owned).collect();
+    if index >= lines.len() || lines[index] == text {
+        return None;
+    }
+    lines[index] = text;
+    Some(lines.join("\n"))
+}
+
+fn replace_draft_table_cell(draft: &str, line: usize, column: usize, columns: usize, text: &str) -> Option<String> {
+    if columns == 0 || column >= columns {
+        return None;
+    }
+    let text = single_editor_line(text);
+    let mut lines: Vec<String> = draft.split('\n').map(str::to_owned).collect();
+    let current = lines.get(line)?;
+    let mut cells: Vec<String> = current.split('\t').map(str::to_owned).collect();
+    if cells.len() < columns {
+        cells.resize(columns, String::new());
+    }
+    cells.truncate(columns);
+    if cells[column] == text {
+        return None;
+    }
+    cells[column] = text;
+    lines[line] = cells.join("\t");
+    Some(lines.join("\n"))
+}
+
+fn single_editor_line(text: &str) -> String {
+    text.chars()
+        .map(|character| if character == '\n' || character == '\r' || character == '\t' { ' ' } else { character })
+        .collect()
+}
+
+fn code_block_texts(draft: &str, formatting: &message_body::ComposerFormatting) -> Vec<String> {
+    let lines: Vec<&str> = draft.split('\n').collect();
+    formatting.code_blocks.iter().map(|block| {
+        let start = block.start.min(lines.len());
+        let end = block.end.min(lines.len());
+        if start < end { lines[start..end].join("\n") } else { String::new() }
+    }).collect()
+}
+
+fn replace_draft_span(draft: &str, start: usize, end: usize, text: &str) -> String {
+    let lines: Vec<&str> = draft.split('\n').collect();
+    let start = start.min(lines.len());
+    let end = end.clamp(start, lines.len());
+    let mut replacement: Vec<String> = text.split('\n').map(|line| line.replace('\r', "")).collect();
+    if replacement.is_empty() {
+        replacement.push(String::new());
+    }
+    let mut next = String::new();
+    for (index, line) in lines.iter().take(start).enumerate() {
+        if index > 0 {
+            next.push('\n');
+        }
+        next.push_str(line);
+    }
+    for (index, line) in replacement.iter().enumerate() {
+        if start > 0 || index > 0 {
+            next.push('\n');
+        }
+        next.push_str(line);
+    }
+    for line in lines.iter().skip(end) {
+        next.push('\n');
+        next.push_str(line);
+    }
+    next
+}
+
+enum ComposerSegment {
+    Table { start: usize, end: usize, columns: usize },
+    Code { index: usize, start: usize, end: usize, language: String },
+}
+
+fn live_table_composer<'a>(
+    draft: &'a str,
+    formatting: &message_body::ComposerFormatting,
+    code_editors: &'a [text_editor::Content],
+    size: u32,
+    max_height: f32,
+) -> Element<'a, AppMessage> {
+    let lines: Vec<&str> = draft.split('\n').collect();
+    let mut segments = Vec::new();
+    for table in &formatting.tables {
+        let start = table.start.min(lines.len());
+        let end = table.end.min(lines.len());
+        if start < end {
+            segments.push((start, ComposerSegment::Table { start, end, columns: usize::from(table.columns).clamp(1, 12) }));
+        }
+    }
+    for (index, block) in formatting.code_blocks.iter().enumerate() {
+        let start = block.start.min(lines.len());
+        let end = block.end.min(lines.len());
+        if start < end {
+            segments.push((start, ComposerSegment::Code { index, start, end, language: block.language.clone() }));
+        }
+    }
+    segments.sort_by_key(|segment| segment.0);
+    let mut blocks: Vec<Element<'a, AppMessage>> = Vec::new();
+    let mut cursor = 0usize;
+    let mut first_cell = true;
+    for (_, segment) in segments {
+        let (start, end) = match &segment {
+            ComposerSegment::Table { start, end, .. } | ComposerSegment::Code { start, end, .. } => (*start, *end),
+        };
+        if start < cursor {
+            continue;
+        }
+        for index in cursor..start {
+            blocks.push(draft_line_input(lines[index], index, size));
+        }
+        match segment {
+            ComposerSegment::Table { start, end, columns } => {
+                blocks.push(draft_table_grid(&lines[start..end], start, columns, size, &mut first_cell));
+            }
+            ComposerSegment::Code { index, language, .. } => {
+                if let Some(editor) = code_editors.get(index) {
+                    blocks.push(draft_code_box(editor, &language, index, size));
+                }
+            }
+        }
+        cursor = end;
+    }
+    for index in cursor..lines.len() {
+        blocks.push(draft_line_input(lines[index], index, size));
+    }
+    let mut body = column![].spacing(8).width(Fill);
+    for block in blocks {
+        body = body.push(block);
+    }
+    container(scrollable(body).height(iced::Length::Shrink).style(ui_scroll))
+        .max_height(max_height)
+        .width(Fill)
+        .padding([8, 8])
+        .into()
+}
+
+fn draft_code_box<'a>(editor: &'a text_editor::Content, language: &str, index: usize, size: u32) -> Element<'a, AppMessage> {
+    let selected = message_body::CodeLanguage::from_id(language);
+    container(column![
+        pick_list(message_body::CodeLanguage::ALL, Some(selected), move |language| AppMessage::SetDraftCodeLanguage { index, language })
+            .width(220)
+            .padding([6, 10])
+            .text_size(13)
+            .style(appearance::ui_pick_list()),
+        text_editor::TextEditor::new(editor)
+            .id(format!("draft-code-{index}"))
+            .placeholder(tr("Write code"))
+            .on_action(move |action| AppMessage::DraftCodeAction { index, action })
+            .font(Font::MONOSPACE)
+            .padding([8, 10])
+            .size(size)
+            .height(iced::Length::Shrink)
+            .min_height(96.0)
+            .style(|theme, status| text_editor::Style {
+                background: tone(theme, Tone::Canvas).into(),
+                border: Border::default(),
+                ..text_editor::default(theme, status)
+            }),
+    ].spacing(8))
+        .padding(10)
+        .width(Fill)
+        .style(ui_surface(Tone::Canvas, true, 6.0))
+        .into()
+}
+
+fn draft_line_input<'a>(line: &'a str, index: usize, size: u32) -> Element<'a, AppMessage> {
+    text_input(tr("Type a message"), line)
+        .id(format!("draft-line-{index}"))
+        .on_input(move |text| AppMessage::EditDraftLine { index, text })
+        .padding([8, 10])
+        .size(size)
+        .width(Fill)
+        .style(ui_input(false))
+        .into()
+}
+
+fn draft_table_grid<'a>(
+    lines: &[&'a str],
+    line_start: usize,
+    columns: usize,
+    size: u32,
+    first_cell: &mut bool,
+) -> Element<'a, AppMessage> {
+    let mut grid = column![].spacing(0).width(Fill);
+    for (offset, line) in lines.iter().enumerate() {
+        let mut cells: Vec<&str> = line.split('\t').collect();
+        if cells.is_empty() {
+            cells.push("");
+        }
+        while cells.len() < columns {
+            cells.push("");
+        }
+        cells.truncate(columns);
+        let line_index = line_start + offset;
+        let header = offset == 0;
+        let mut visual = row![].spacing(0).width(Fill);
+        for (column_index, cell) in cells.into_iter().enumerate() {
+            let id = if *first_cell {
+                *first_cell = false;
+                "draft-table-0-0".to_owned()
+            } else {
+                format!("draft-table-{line_index}-{column_index}")
+            };
+            visual = visual.push(
+                text_input("", cell)
+                    .id(id)
+                    .on_input(move |text| AppMessage::EditDraftTableCell {
+                        line: line_index,
+                        column: column_index,
+                        text,
+                    })
+                    .padding([8, 10])
+                    .size(size)
+                    .width(Fill)
+                    .style(move |theme, status| table_cell_input(theme, status, header)),
+            );
+        }
+        grid = grid.push(visual);
+    }
+    grid.into()
+}
+
+fn table_cell_input(theme: &Theme, status: text_input::Status, header: bool) -> text_input::Style {
+    text_input::Style {
+        background: tone(theme, if header { Tone::Card } else { Tone::Canvas }).into(),
+        border: Border::default().width(1.0).color(match status {
+            text_input::Status::Focused { .. } => tone(theme, Tone::Accent),
+            _ => tone(theme, Tone::QuoteBar),
+        }),
+        icon: tone(theme, Tone::Secondary),
+        placeholder: tone(theme, Tone::Muted),
+        value: tone(theme, Tone::Text),
+        selection: tone(theme, Tone::SelectedHover),
+    }
 }
 
 fn group_title_edit_label() -> &'static str {
@@ -20684,6 +21214,11 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
             } else {
                 content
             };
+            let content = if state.draft_discard_for.is_some() {
+                stack![content, discard_draft_dialog()].width(Fill).height(Fill).into()
+            } else {
+                content
+            };
             if state.incoming_call_notices.iter().any(|notice| notice.alert_visible) {
                 stack![content, state.incoming_call_banners_view(size)]
                     .width(Fill)
@@ -20708,7 +21243,9 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
             || state.status_note_open
             || state.app_menu.surface.is_some(),
         state.message_search_open,
-        if global_search_visible(state) {
+        if state.draft_discard_for.is_some() {
+            Some(AppMessage::CancelDiscardDraft)
+        } else if global_search_visible(state) {
             Some(AppMessage::DismissGlobalSearch)
         } else if state.section == Section::Chats && !state.settings_open && state.chat_list_search.is_some()
             && state.message_menu_for.is_none() && !state.message_search_open
@@ -20738,6 +21275,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_attachment_card_opens_from_both_ends_without_overflowing() {
+        use iced::advanced::{Layout, Shell, layout, mouse, widget::Tree};
+        let mut renderer = chat_render_tests::headless_renderer();
+        let url = "https://example.com/shared/report.xlsx";
+        let file = ost::api::ChatFileRef {
+            preview: None, attachment_id: Some("fixture".into()),
+            name: "a-very-long-filename-for-a-spreadsheet-with-more-details.xlsx".into(),
+            file_type: Some("xlsx".into()), object_url: url.into(), share_url: None,
+            sender: None, time: None,
+        };
+        for x in [8.0, 210.0, 410.0] {
+            let mut card = message_actions::view(file_attachment_card(&file, 420.0),
+                || space::vertical().into(), None, message_actions::Config {
+                    context: "fixture".into(), placement: message_actions::Placement::Message { outgoing: true },
+                    enabled: true, force_visible: false, reaction_picker: false,
+                });
+            let mut tree = Tree::new(card.as_widget());
+            let node = card.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(500.0, 100.0)));
+            assert_eq!(node.size().width, 420.0);
+            if x == 8.0 && std::env::var_os("TEAMS_LINUX_TEST_SNAPSHOTS").is_some() {
+                let size = iced::Size::new(500, 100);
+                let pixels = chat_render_tests::capture(&mut renderer, &card, &tree, &node,
+                    &teams_theme(preferences::Appearance::Dark), size, 1.0);
+                chat_render_tests::save_snapshot("attachment-card.png", size, &pixels);
+            }
+            let viewport = iced::Rectangle::with_size(iced::Size::new(500.0, 100.0));
+            let cursor = mouse::Cursor::Available(iced::Point::new(x, node.size().height / 2.0));
+            let mut messages = Vec::new();
+            for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
+                card.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), cursor,
+                    &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            }
+            assert!(messages.iter().any(|message| matches!(message, AppMessage::OpenMessageLink(open) if open == url)));
+        }
+    }
+
+    #[test]
     fn escape_closes_composer_popover_then_formatting_without_losing_draft() {
         let mut state = TeamsApp::from_client_id(String::new());
         state.demo_mode = true;
@@ -20752,6 +21327,26 @@ mod tests {
         assert_eq!(state.draft, "Example\nsecond line");
         assert!(state.composer_uses_editor());
         assert!(formatting_escape_action(&state).is_none());
+    }
+
+    #[test]
+    fn trash_asks_before_discarding_the_draft() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        state.drafts_loaded = true;
+        state.formatting_open = true;
+        state.selected_chat = Some("chat:1".into());
+        drop(update(&mut state, AppMessage::DraftChanged("tabela".into())));
+        drop(update(&mut state, AppMessage::RequestDiscardDraft));
+        assert_eq!(state.draft_discard_for.as_deref(), Some("chat:chat:1"));
+        assert_eq!(state.draft, "tabela");
+        drop(update(&mut state, AppMessage::CancelDiscardDraft));
+        assert!(state.draft_discard_for.is_none());
+        assert_eq!(state.draft, "tabela");
+        drop(update(&mut state, AppMessage::RequestDiscardDraft));
+        drop(update(&mut state, AppMessage::ConfirmDiscardDraft));
+        assert!(state.draft_discard_for.is_none());
+        assert!(state.draft.is_empty());
     }
 
     #[test]
@@ -21396,8 +21991,9 @@ mod tests {
         assert_eq!(update_inner(&mut state, resize).units(), 0);
 
         let close = AppMessage::MainWindowAction(main, Action::Close);
-        assert_eq!(update_inner(&mut state, close.clone()).units(), 2);
+        assert_eq!(update_inner(&mut state, close.clone()).units(), 3);
         assert!(state.closing_window);
+        assert!(state.call_window.is_none());
         assert!(state.prejoin.is_none());
         assert_eq!(update_inner(&mut state, close).units(), 0);
     }
@@ -23428,22 +24024,12 @@ mod tests {
     }
 
     #[test]
-    fn composer_preview_toggle_requires_rich_editor_and_nonempty_draft() {
+    fn composer_preview_stays_closed_because_formatting_is_in_the_input() {
         let mut state = TeamsApp::from_client_id(String::new());
         state.formatting_open = true;
         state.draft = "Prévia rica".into();
+        state.draft_preview_open = true;
 
-        let _ = update(&mut state, AppMessage::ToggleDraftPreview);
-        assert!(state.draft_preview_open);
-        let _ = update(&mut state, AppMessage::ToggleDraftPreview);
-        assert!(!state.draft_preview_open);
-
-        state.draft.clear();
-        let _ = update(&mut state, AppMessage::ToggleDraftPreview);
-        assert!(!state.draft_preview_open);
-
-        state.draft = "Prévia rica".into();
-        state.formatting_open = false;
         let _ = update(&mut state, AppMessage::ToggleDraftPreview);
         assert!(!state.draft_preview_open);
     }
@@ -26011,6 +26597,77 @@ mod tests {
     }
 
     #[test]
+    fn composer_table_cell_edit_writes_the_cell_and_keeps_the_grid() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        state.drafts_loaded = true;
+        state.formatting_open = true;
+        state.selected_chat = Some("chat:1".into());
+        let _ = update_inner(&mut state, AppMessage::InsertDraftTable { rows: 2, columns: 3 });
+        assert_eq!(state.draft, "\t\t\n\t\t");
+        assert!(!state.draft_preview_open);
+        let key = state.draft_key().expect("chat draft");
+        let table = state.draft_formatting[&key].tables[0].clone();
+        assert_eq!((table.start, table.end, table.columns), (0, 2, 3));
+
+        let _ = update_inner(&mut state, AppMessage::EditDraftTableCell {
+            line: 0,
+            column: 2,
+            text: "asdasdasdasd".into(),
+        });
+        let _ = update_inner(&mut state, AppMessage::EditDraftTableCell {
+            line: 1,
+            column: 2,
+            text: "linha\nnova".into(),
+        });
+        assert_eq!(state.draft, "\t\tasdasdasdasd\n\t\tlinha nova");
+        let table = state.draft_formatting[&key].tables[0].clone();
+        assert_eq!((table.start, table.end, table.columns), (0, 2, 3));
+        assert_eq!(state.composer_content.text(), state.draft);
+    }
+
+    #[test]
+    fn composer_code_box_keeps_the_language_and_the_typed_lines() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        state.drafts_loaded = true;
+        state.formatting_open = true;
+        state.selected_chat = Some("chat:1".into());
+        drop(update(&mut state, AppMessage::DraftChanged("print('ok')".into())));
+        state.formatting_open = true;
+        let key = state.draft_key().expect("chat draft");
+        let end = unicode_segmentation::UnicodeSegmentation::graphemes(state.draft.as_str(), true).count();
+        state.draft_selection = Some((key, 0, end));
+        drop(update(&mut state, AppMessage::ToggleDraftCodeBlock));
+        assert_eq!(state.code_editors.len(), 1);
+        assert_eq!(state.code_editors[0].text(), "print('ok')");
+        drop(update(&mut state, AppMessage::SetDraftCodeLanguage {
+            index: 0,
+            language: message_body::CodeLanguage::Python,
+        }));
+        assert_eq!(state.active_formatting().code_blocks[0].language, "python");
+        drop(update(&mut state, AppMessage::DraftCodeAction {
+            index: 0,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentEnd),
+        }));
+        drop(update(&mut state, AppMessage::DraftCodeAction {
+            index: 0,
+            action: text_editor::Action::Edit(text_editor::Edit::Enter),
+        }));
+        drop(update(&mut state, AppMessage::DraftCodeAction {
+            index: 0,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        assert_eq!(state.draft, "print('ok')\nx");
+        let block = state.active_formatting().code_blocks[0].clone();
+        assert_eq!((block.start, block.end, block.language.as_str()), (0, 2, "python"));
+        assert_eq!(state.code_editors[0].text(), state.draft);
+        assert_eq!(state.composer_content.text(), state.draft);
+        let html = message_body::Document::from_editor(&state.draft, &state.active_formatting()).to_html();
+        assert!(html.contains("itemid=\"python\""));
+    }
+
+    #[test]
     fn group_leave_requires_confirmation_and_cancel_preserves_the_conversation() {
         let mut state = TeamsApp::from_client_id(String::new());
         let group_id = "19:project@thread.v2";
@@ -26573,6 +27230,18 @@ mod tests {
     }
 
     #[test]
+    fn delivered_marker_stays_on_the_latest_outgoing_message_when_reads_are_hidden() {
+        let messages = vec![
+            GraphMessage { id: "out-1".into(), is_mine: true, ..Default::default() },
+            GraphMessage { id: "in-2".into(), ..Default::default() },
+            GraphMessage { id: "out-3".into(), is_mine: true, is_deleted: true, ..Default::default() },
+            GraphMessage { id: "out-4".into(), is_mine: true, ..Default::default() },
+            GraphMessage { id: "local:pending".into(), is_mine: true, ..Default::default() },
+        ];
+        assert_eq!(delivery_status_message_id(&messages), Some("out-4"));
+    }
+
+    #[test]
     fn readers_follow_the_full_history_and_exclude_self_and_unknown_frontiers() {
         let messages = vec![
             GraphMessage { id: "out-1".into(), is_mine: true, ..Default::default() },
@@ -26587,7 +27256,7 @@ mod tests {
         ];
         let names = HashMap::from([("peer".to_string(), "Alex".to_string())]);
         let readers = read_receipt_readers(&messages, &receipts, "me", &names);
-        assert_eq!(readers.get("out-1"), Some(&vec!["Alex".to_owned()]));
+        assert!(!readers.contains_key("out-1"));
         assert_eq!(readers.get("out-3"), Some(&vec!["Alex".to_owned()]));
         assert!(!readers.contains_key("out-4"));
     }
@@ -26605,7 +27274,7 @@ mod tests {
         let receipts = ost::api::parse_consumptionhorizons(&value);
         let names = HashMap::from([("peer".to_string(), "Alex".to_string())]);
         let readers = read_receipt_readers(&messages, &receipts, "me", &names);
-        assert_eq!(readers.get("server-1"), Some(&vec!["Alex".to_owned()]));
+        assert!(!readers.contains_key("server-1"));
         assert_eq!(readers.get("server-2"), Some(&vec!["Alex".to_owned()]));
         assert!(!readers.contains_key("server-3"));
     }

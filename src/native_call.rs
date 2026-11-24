@@ -231,29 +231,29 @@ impl Phase {
     /// from the owner's calendar, waits for the service to confirm media.
     /// Those are different waits and must not share the call wording.
     pub fn status(self, direct_call: bool) -> &'static str {
-        if direct_call {
+        crate::i18n::tr(if direct_call {
             match self {
-                Phase::Preparing => "Preparando a ligação…",
-                Phase::Joining => "Ligando…",
-                Phase::Waiting => "Chamando…",
-                Phase::Connecting => "Conectando a ligação…",
-                Phase::Connected => "Conectado",
-                Phase::Ending => "Encerrando a ligação…",
-                Phase::Ended => "A ligação foi encerrada.",
-                Phase::Failed => "Não foi possível continuar a ligação",
+                Phase::Preparing => "Preparing the call…",
+                Phase::Joining => "Calling…",
+                Phase::Waiting => "Ringing…",
+                Phase::Connecting => "Connecting the call…",
+                Phase::Connected => "Connected",
+                Phase::Ending => "Ending the call…",
+                Phase::Ended => "The call ended.",
+                Phase::Failed => "The call could not continue",
             }
         } else {
             match self {
-                Phase::Preparing => "Preparando a reunião…",
-                Phase::Joining => "Entrando na reunião…",
-                Phase::Waiting => "Confirmando a entrada na reunião…",
-                Phase::Connecting => "Conectando o áudio da reunião…",
-                Phase::Connected => "Conectado à reunião",
-                Phase::Ending => "Saindo da reunião…",
-                Phase::Ended => "A reunião foi encerrada.",
-                Phase::Failed => "Não foi possível continuar na reunião",
+                Phase::Preparing => "Preparing the meeting…",
+                Phase::Joining => "Joining the meeting…",
+                Phase::Waiting => "Confirming the meeting…",
+                Phase::Connecting => "Connecting meeting audio…",
+                Phase::Connected => "Connected to the meeting",
+                Phase::Ending => "Leaving the meeting…",
+                Phase::Ended => "The meeting ended.",
+                Phase::Failed => "Could not stay in the meeting",
             }
-        }
+        })
     }
 }
 
@@ -1882,13 +1882,12 @@ mod tests {
 
     #[test]
     fn meeting_wait_is_not_a_call_and_a_call_wait_is_not_a_meeting() {
-        assert_eq!(Phase::Waiting.status(false), "Confirmando a entrada na reunião…");
-        assert_eq!(Phase::Waiting.status(true), "Chamando…");
-        assert!(!Phase::Waiting.status(false).contains("Chamando"));
-        assert!(!Phase::Waiting.status(false).contains("resposta"));
-        assert!(!Phase::Waiting.status(true).contains("reunião"));
-        assert_eq!(Phase::Ended.status(false), "A reunião foi encerrada.");
-        assert_eq!(Phase::Ended.status(true), "A ligação foi encerrada.");
+        assert_eq!(Phase::Waiting.status(false), "Confirming the meeting…");
+        assert_eq!(Phase::Waiting.status(true), "Ringing…");
+        assert!(!Phase::Waiting.status(false).contains("Ringing"));
+        assert!(!Phase::Waiting.status(true).contains("meeting"));
+        assert_eq!(Phase::Ended.status(false), "The meeting ended.");
+        assert_eq!(Phase::Ended.status(true), "The call ended.");
     }
 
     #[test]

@@ -124,7 +124,7 @@ pub fn toolbar(state: &TeamsApp) -> Element<'_, AppMessage> {
     let more_menu = (state.composer_menu == Some(Menu::More)).then(|| more_options(state));
     tools = tools.push(crate::composer_popover::view(
         control(Icon::More, tr("More formatting options"), Some(AppMessage::ToggleComposerMenu(Menu::More)), more_menu.is_some()), more_menu));
-    let clear = control(Icon::Delete, tr("Clear draft text"), Some(AppMessage::ClearDraftText), false);
+    let clear = control(Icon::Delete, tr("Discard draft"), Some(AppMessage::RequestDiscardDraft), false);
     container(row![container(tools.wrap()).width(Fill), clear].spacing(8).align_y(Alignment::Start))
         .width(Fill).padding([4, 2]).into()
 }
@@ -191,7 +191,6 @@ fn more_options(state: &TeamsApp) -> Element<'_, AppMessage> {
         crate::message_menu_action(Icon::QuoteReply, tr("Block quote"), Some(AppMessage::ToggleDraftQuote), Tone::Text),
         crate::message_menu_action(Icon::Table, tr("Insert table"), Some(AppMessage::ToggleComposerMenu(Menu::Table)), Tone::Text),
         crate::message_menu_action(Icon::Delete, tr("Clear formatting"), state.selected_draft_range().map(|_| AppMessage::ClearDraftFormatting), Tone::Text),
-        crate::message_menu_action(Icon::Preview, tr("Preview message"), (!state.draft.is_empty()).then_some(AppMessage::ToggleDraftPreview), Tone::Text),
     ].spacing(4), 250.0)
 }
 

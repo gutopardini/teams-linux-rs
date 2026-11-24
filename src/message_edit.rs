@@ -25,6 +25,7 @@ pub fn view(state: &TeamsApp) -> Element<'_, AppMessage> {
             message_body::ComposerHighlightSettings::new(
                 &state.editing_message_text,
                 state.editing_message_formatting.clone(),
+                state.preferences.message_size,
             ),
             message_body::composer_highlight_format,
         )

@@ -4,8 +4,10 @@
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
 #include <spa/param/video/raw.h>
+#include <spa/pod/command.h>
 
 #include <cstdint>
+#include <mutex>
 #include <unistd.h>
 
 extern "C" {
@@ -26,6 +28,12 @@ int teams_cpu_screencast(int fd, uint32_t node_id, const uint8_t* stop, teams_cp
                          void* user);
 
 }  // extern "C"
+
+namespace webrtc {
+// Defined in libwebrtc. It dlopens libpipewire and fills the pw_* stubs.
+// Until it runs, those stubs jump to a null pointer.
+bool InitializePipeWire();
+}  // namespace webrtc
 
 namespace {
 
@@ -80,12 +88,28 @@ struct Pipe {
   }
 };
 
+void on_destroy(void* /*data*/) {}
+
 void on_state(void* data, enum pw_stream_state /*old*/, enum pw_stream_state state,
               const char* /*error*/) {
   if (state == PW_STREAM_STATE_ERROR) {
     static_cast<State*>(data)->failed = 1;
   }
 }
+
+void on_control_info(void* /*data*/, uint32_t /*id*/, const pw_stream_control* /*control*/) {}
+
+void on_io_changed(void* /*data*/, uint32_t /*id*/, void* /*area*/, uint32_t /*size*/) {}
+
+void on_add_buffer(void* /*data*/, pw_buffer* /*buffer*/) {}
+
+void on_remove_buffer(void* /*data*/, pw_buffer* /*buffer*/) {}
+
+void on_drained(void* /*data*/) {}
+
+void on_command(void* /*data*/, const spa_command* /*command*/) {}
+
+void on_trigger_done(void* /*data*/) {}
 
 void on_param(void* data, uint32_t id, const struct spa_pod* param) {
   auto* state = static_cast<State*>(data);
@@ -198,11 +222,21 @@ int run(int fd, uint32_t node_id, const uint8_t* stop, teams_cpu_frame_fn callba
   state.callback = callback;
   state.user = user;
   state.stop = stop;
+  // Every slot advertised by PW_VERSION_STREAM_EVENTS must be a real function.
+  // A null slot is invoked during connect and kills the process.
   static const pw_stream_events events = {
       .version = PW_VERSION_STREAM_EVENTS,
+      .destroy = on_destroy,
       .state_changed = on_state,
+      .control_info = on_control_info,
+      .io_changed = on_io_changed,
       .param_changed = on_param,
+      .add_buffer = on_add_buffer,
+      .remove_buffer = on_remove_buffer,
       .process = on_process,
+      .drained = on_drained,
+      .command = on_command,
+      .trigger_done = on_trigger_done,
   };
   pw_stream_add_listener(pipe.stream, &pipe.hook, &events, &state);
   uint8_t buffer[2048];
@@ -242,8 +276,20 @@ extern "C" int teams_cpu_screencast(int fd, uint32_t node_id, const uint8_t* sto
     }
     return 1;
   }
-  pw_init(nullptr, nullptr);
-  const int rc = run(fd, node_id, stop, callback, user);
-  pw_deinit();
-  return rc;
+  // libwebrtc replaces pw_* with stubs that stay null until InitializePipeWire
+  // dlopens libpipewire-0.3.so.0. pw_deinit is process-global, so the library
+  // stays loaded for the rest of the process.
+  static std::once_flag pipewire_ready;
+  static bool pipewire_ok = false;
+  std::call_once(pipewire_ready, [] {
+    pipewire_ok = webrtc::InitializePipeWire();
+    if (pipewire_ok) {
+      pw_init(nullptr, nullptr);
+    }
+  });
+  if (!pipewire_ok) {
+    close(fd);
+    return 1;
+  }
+  return run(fd, node_id, stop, callback, user);
 }

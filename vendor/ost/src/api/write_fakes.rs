@@ -11,6 +11,7 @@ use super::apps::{INSTALL_CALLER, install_app_for_user};
 use super::chat::{
     delete_message_with_client, reply_rich_message_with_client_id,
     mark_read_with_client, read_receipts_data, remove_reaction_with_client,
+    send_message_with_client_id,
     send_reaction_with_client, send_typing_indicator_with_client,
     set_chat_hidden_with_client, set_chat_muted_with_client,
     thread_reply_rich_with_client_id,
@@ -24,6 +25,19 @@ use super::teams::{
 const TEAM_GUID: &str = "11111111-2222-3333-4444-555555555555";
 const TEAM_THREAD: &str = "19:team@thread.tacv2";
 const CHANNEL: &str = "19:chan@thread.tacv2";
+
+#[tokio::test]
+async fn plain_message_post_contains_clickable_sharepoint_link() {
+    let route = "/chat/v1/users/ME/conversations/chat-1/messages";
+    let fake = Fake::start(vec![("POST", route, 200, "{}".into())]).await;
+    send_message_with_client_id(&fake.client(), "chat-1",
+        "See https://example.sharepoint.com/:x:/g/personal/sample/file?x=1&y=2", "123")
+        .await.expect("local fixture accepts message");
+    let requests = fake.requests();
+    let body = requests[0].json();
+    assert_eq!(body["content"], "<p>See <a href=\"https://example.sharepoint.com/:x:/g/personal/sample/file?x=1&amp;y=2\">https://example.sharepoint.com/:x:/g/personal/sample/file?x=1&amp;y=2</a></p>");
+    assert_eq!(body["clientmessageid"], "123");
+}
 
 /// The middle tier takes AAD Bearer + X-Skypetoken; neither the Graph
 /// token nor a chat-service header goes with it.

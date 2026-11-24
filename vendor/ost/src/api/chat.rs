@@ -379,24 +379,45 @@ fn html_escape(text: &str) -> String {
 }
 
 /// Preserve line breaks and repeated spaces in normal HTML message text.
+fn append_prose(output: &mut String, text: &str, line_start: &mut bool, previous_space: &mut bool) {
+    for ch in text.chars() {
+        match ch {
+            '\n' => { output.push_str("<br>"); *line_start = true; *previous_space = false; }
+            ' ' => {
+                output.push_str(if *line_start || *previous_space { "&nbsp;" } else { " " });
+                *previous_space = true;
+            }
+            '&' => { output.push_str("&amp;"); *line_start = false; *previous_space = false; }
+            '<' => { output.push_str("&lt;"); *line_start = false; *previous_space = false; }
+            '>' => { output.push_str("&gt;"); *line_start = false; *previous_space = false; }
+            '"' => { output.push_str("&quot;"); *line_start = false; *previous_space = false; }
+            '\'' => { output.push_str("&#39;"); *line_start = false; *previous_space = false; }
+            _ => { output.push(ch); *line_start = false; *previous_space = false; }
+        }
+    }
+}
+
 fn prose_html(text: &str) -> String {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut output = String::new();
     let mut line_start = true;
     let mut previous_space = false;
-    for ch in normalized.chars() {
-        match ch {
-            '\n' => { output.push_str("<br>"); line_start = true; previous_space = false; }
-            ' ' => {
-                output.push_str(if line_start || previous_space { "&nbsp;" } else { " " });
-                previous_space = true;
-            }
-            '&' => { output.push_str("&amp;"); line_start = false; previous_space = false; }
-            '<' => { output.push_str("&lt;"); line_start = false; previous_space = false; }
-            '>' => { output.push_str("&gt;"); line_start = false; previous_space = false; }
-            '"' => { output.push_str("&quot;"); line_start = false; previous_space = false; }
-            '\'' => { output.push_str("&#39;"); line_start = false; previous_space = false; }
-            _ => { output.push(ch); line_start = false; previous_space = false; }
+    for word in normalized.split_inclusive(char::is_whitespace) {
+        let token = word.trim_end_matches(char::is_whitespace)
+            .trim_end_matches(['.', ',', ';', '!', '?', ')', ']']);
+        let is_link = (token.starts_with("https://") || token.starts_with("http://"))
+            && !token.chars().any(char::is_control)
+            && url::Url::parse(token).ok().is_some_and(|url| {
+                url.host_str().is_some() && url.username().is_empty() && url.password().is_none()
+            });
+        if is_link {
+            let escaped = html_escape(token);
+            output.push_str(&format!("<a href=\"{escaped}\">{escaped}</a>"));
+            line_start = false;
+            previous_space = false;
+            append_prose(&mut output, &word[token.len()..], &mut line_start, &mut previous_space);
+        } else {
+            append_prose(&mut output, word, &mut line_start, &mut previous_space);
         }
     }
     output
@@ -5176,6 +5197,15 @@ src="x">"#
             build_message_html("``` `x` ```\nstill prose"),
             "<p>``` `x` ```<br>still prose</p>"
         );
+    }
+
+    #[test]
+    fn plain_outgoing_links_are_clickable_and_keep_queries_and_line_breaks() {
+        let input = "Open https://example.sharepoint.com/:x:/g/personal/sample/file?one=1&two=2.\n\nNext https://example.org/path";
+        let body = send_message_body(input);
+        assert_eq!(body["content"], "<p>Open <a href=\"https://example.sharepoint.com/:x:/g/personal/sample/file?one=1&amp;two=2\">https://example.sharepoint.com/:x:/g/personal/sample/file?one=1&amp;two=2</a>.<br><br>Next <a href=\"https://example.org/path\">https://example.org/path</a></p>");
+        assert!(!build_message_html("https://user:secret@example.org/ javascript:alert(1)").contains("<a "));
+        assert!(!build_message_html("```\nhttps://example.org/\n```").contains("<a "));
     }
 
     #[test]

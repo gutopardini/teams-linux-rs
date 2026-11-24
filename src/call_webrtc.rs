@@ -398,8 +398,18 @@ fn linux_portal_capture(
         use ashpd::desktop::screencast::Screencast;
         let Ok(proxy) = Screencast::new().await else { return true };
         let Ok(session) = proxy.create_session().await else { return true };
-        let failed = cast_selected_source(&proxy, &session, &stop, sender).await;
-        let _ = session.close().await;
+        // Leave drops this thread and joins it. A portal reply or the capture
+        // thread must not keep that join parked, or the call stays on "Leaving".
+        let failed = tokio::select! {
+            biased;
+            _ = portal_stopped(&stop) => true,
+            result = cast_selected_source(&proxy, &session, &stop, sender) => result,
+        };
+        tokio::select! {
+            biased;
+            _ = session.close() => {}
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
         failed
     })
 }

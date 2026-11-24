@@ -45,6 +45,8 @@ pub struct Block {
     pub ordered_list_value: Option<i64>,
     pub heading: u8,
     pub pre: bool,
+    /// Language id of a code box. Empty means a plain `<pre>` block.
+    pub code_language: String,
     pub table: Option<Table>,
 }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -509,6 +511,92 @@ pub struct CodeBlockRange {
     /// Inclusive first line, exclusive last line.
     pub start: usize,
     pub end: usize,
+    /// Empty is plain text. Any other value is a code-snippet language id.
+    #[serde(default)]
+    pub language: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeLanguage {
+    Plain, Bash, C, Cpp, CSharp, Css, Go, Html, Java, JavaScript, Json, Kotlin,
+    Markdown, Php, PowerShell, Python, R, Ruby, Rust, Sql, Swift, TypeScript, Xml, Yaml,
+}
+
+impl CodeLanguage {
+    pub const ALL: [Self; 24] = [
+        Self::Plain, Self::Bash, Self::C, Self::Cpp, Self::CSharp, Self::Css, Self::Go, Self::Html,
+        Self::Java, Self::JavaScript, Self::Json, Self::Kotlin, Self::Markdown, Self::Php,
+        Self::PowerShell, Self::Python, Self::R, Self::Ruby, Self::Rust, Self::Sql, Self::Swift,
+        Self::TypeScript, Self::Xml, Self::Yaml,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Plain => "text",
+            Self::Bash => "bash",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Css => "css",
+            Self::Go => "go",
+            Self::Html => "html",
+            Self::Java => "java",
+            Self::JavaScript => "javascript",
+            Self::Json => "json",
+            Self::Kotlin => "kotlin",
+            Self::Markdown => "markdown",
+            Self::Php => "php",
+            Self::PowerShell => "powershell",
+            Self::Python => "python",
+            Self::R => "r",
+            Self::Ruby => "ruby",
+            Self::Rust => "rust",
+            Self::Sql => "sql",
+            Self::Swift => "swift",
+            Self::TypeScript => "typescript",
+            Self::Xml => "xml",
+            Self::Yaml => "yaml",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plain => crate::i18n::tr("Plain text"),
+            Self::Bash => "Bash",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::CSharp => "C#",
+            Self::Css => "CSS",
+            Self::Go => "Go",
+            Self::Html => "HTML",
+            Self::Java => "Java",
+            Self::JavaScript => "JavaScript",
+            Self::Json => "JSON",
+            Self::Kotlin => "Kotlin",
+            Self::Markdown => "Markdown",
+            Self::Php => "PHP",
+            Self::PowerShell => "PowerShell",
+            Self::Python => "Python",
+            Self::R => "R",
+            Self::Ruby => "Ruby",
+            Self::Rust => "Rust",
+            Self::Sql => "SQL",
+            Self::Swift => "Swift",
+            Self::TypeScript => "TypeScript",
+            Self::Xml => "XML",
+            Self::Yaml => "YAML",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Self {
+        Self::ALL.into_iter().find(|language| language.id() == id).unwrap_or(Self::Plain)
+    }
+}
+
+impl std::fmt::Display for CodeLanguage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,10 +618,11 @@ pub struct ComposerFormatting {
 pub struct ComposerHighlightSettings {
     pub formatting: ComposerFormatting,
     pub line_starts: Vec<usize>,
+    pub base_size: u16,
 }
 
 impl ComposerHighlightSettings {
-    pub fn new(text: &str, formatting: ComposerFormatting) -> Self {
+    pub fn new(text: &str, formatting: ComposerFormatting, base_size: u16) -> Self {
         use unicode_segmentation::UnicodeSegmentation;
 
         let mut line_starts = Vec::new();
@@ -548,7 +637,20 @@ impl ComposerHighlightSettings {
         Self {
             formatting,
             line_starts,
+            base_size: base_size.max(1),
         }
+    }
+}
+
+/// Left room for list markers and the quote bar inside the composer.
+pub fn composer_gutter(formatting: &ComposerFormatting) -> f32 {
+    let lists = !formatting.lists.is_empty();
+    let quotes = !formatting.quote_blocks.is_empty();
+    match (lists, quotes) {
+        (true, true) => 42.0,
+        (true, false) => 30.0,
+        (false, true) => 18.0,
+        (false, false) => 0.0,
     }
 }
 
@@ -560,6 +662,8 @@ pub struct ComposerHighlight {
     pub link: bool,
     pub color: Option<u32>,
     pub emoji: bool,
+    /// Pixel size. Zero keeps the editor's own size.
+    pub size_px: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +711,7 @@ impl iced::advanced::text::Highlighter for ComposerHighlighter {
         for (byte, grapheme) in line.grapheme_indices(true) {
             let index = start + grapheme_index;
             grapheme_index += 1;
+            let percent = self.settings.formatting.size_at(index);
             let highlight = ComposerHighlight {
                 bold: self.settings.formatting.marks.iter().any(|range| {
                     range.mark == InlineMark::Bold && range.start <= index && index < range.end
@@ -631,6 +736,12 @@ impl iced::advanced::text::Highlighter for ComposerHighlighter {
                     .any(|range| range.start <= index && index < range.end),
                 color: self.settings.formatting.color_at(index),
                 emoji: typography::is_color_emoji(grapheme),
+                size_px: if percent == 100 {
+                    0
+                } else {
+                    u16::try_from(u32::from(self.settings.base_size) * u32::from(percent) / 100)
+                        .unwrap_or(u16::MAX)
+                },
             };
             let end = byte + grapheme.len();
             // Cover plain runs too, so newly created editor buffers use the
@@ -695,6 +806,7 @@ pub fn composer_highlight_format(
     iced::advanced::text::highlighter::Format {
         color: Some(color),
         font: Some(font),
+        size: (highlight.size_px > 0).then_some(f32::from(highlight.size_px)),
     }
 }
 
@@ -1135,7 +1247,7 @@ impl ComposerFormatting {
                 .flat_map(|range| {
                     split_line_range(range.start, range.end, start, end)
                         .into_iter()
-                        .map(|(start, end)| CodeBlockRange { start, end })
+                        .map(move |(start, end)| CodeBlockRange { start, end, language: range.language.clone() })
                 })
                 .collect();
             normalize_code_blocks(&mut self.code_blocks);
@@ -1163,11 +1275,11 @@ impl ComposerFormatting {
             next.extend(
                 split_line_range(range.start, range.end, start, end)
                     .into_iter()
-                    .map(|(start, end)| CodeBlockRange { start, end }),
+                    .map(move |(start, end)| CodeBlockRange { start, end, language: range.language.clone() }),
             );
         }
         if !remove {
-            next.push(CodeBlockRange { start, end });
+            next.push(CodeBlockRange { start, end, language: String::new() });
             self.lists = self
                 .lists
                 .drain(..)
@@ -1251,7 +1363,7 @@ impl ComposerFormatting {
                 .flat_map(|range| {
                     split_line_range(range.start, range.end, start, end)
                         .into_iter()
-                        .map(|(start, end)| CodeBlockRange { start, end })
+                        .map(move |(start, end)| CodeBlockRange { start, end, language: range.language.clone() })
                 })
                 .collect();
             normalize_lists(&mut self.lists);
@@ -1418,7 +1530,7 @@ impl ComposerFormatting {
             .flat_map(|range| {
                 remap_editable_block_range(range.start, range.end, prefix, old_end, new_end)
                     .into_iter()
-                    .map(|(start, end)| CodeBlockRange { start, end })
+                    .map(move |(start, end)| CodeBlockRange { start, end, language: range.language.clone() })
             })
             .collect();
         normalize_code_blocks(&mut self.code_blocks);
@@ -1651,7 +1763,7 @@ impl ComposerRangeBounds for ListRange {
 }
 impl ComposerRangeBounds for CodeBlockRange {
     fn bounds(&self) -> (usize, usize) { (self.start, self.end) }
-    fn with_bounds(&self, start: usize, end: usize) -> Self { Self { start, end } }
+    fn with_bounds(&self, start: usize, end: usize) -> Self { Self { start, end, language: self.language.clone() } }
 }
 impl ComposerRangeBounds for QuoteRange {
     fn bounds(&self) -> (usize, usize) { (self.start, self.end) }
@@ -1814,8 +1926,10 @@ fn normalize_code_blocks(ranges: &mut Vec<CodeBlockRange>) {
         if range.start >= range.end {
             continue;
         }
-        if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end) {
+        if let Some(last) = merged.last_mut().filter(|last| range.start <= last.end && last.language == range.language) {
             last.end = last.end.max(range.end);
+        } else if merged.last().is_some_and(|last| range.start < last.end) {
+            continue;
         } else {
             merged.push(range);
         }
@@ -3166,6 +3280,19 @@ impl Builder<'_> {
                 }
                 if name == "pre" {
                     self.current.pre = true;
+                    if let Some((language, code)) = code_snippet_payload(element) {
+                        self.current.code_language = language;
+                        let mut code_style = style.clone();
+                        code_style.code = true;
+                        if code.is_empty() {
+                            self.current.runs.push(Run { text: String::new(), style: code_style });
+                        } else {
+                            self.push(&code, &code_style);
+                        }
+                        self.flush();
+                        self.current = old;
+                        return;
+                    }
                 }
                 if name.starts_with('h') {
                     self.current.heading = name[1..].parse().unwrap_or(0);
@@ -3909,10 +4036,12 @@ impl Document {
                 .position(|grapheme| *grapheme == "\n")
                 .map(|offset| line_start + offset)
                 .unwrap_or(graphemes.len());
-            let pre = formatting
+            let code_block = formatting
                 .code_blocks
                 .iter()
-                .any(|range| range.start <= line_index && line_index < range.end);
+                .find(|range| range.start <= line_index && line_index < range.end);
+            let pre = code_block.is_some();
+            let code_language = code_block.map(|range| range.language.clone()).unwrap_or_default();
             let mut runs: Vec<Run> = Vec::new();
             for index in line_start..line_end {
                 let mut style = Style {
@@ -3981,6 +4110,7 @@ impl Document {
                 runs,
                 marker,
                 pre,
+                code_language,
                 quote: u8::from(quoted),
                 quote_group: quoted.then_some(quote_group).unwrap_or_default(),
                 ..Default::default()
@@ -4022,17 +4152,28 @@ impl Document {
             }
             if block.pre {
                 let mut end = index + 1;
-                while end < self.blocks.len() && self.blocks[end].pre {
+                while end < self.blocks.len() && self.blocks[end].pre && self.blocks[end].code_language == block.code_language {
                     end += 1;
                 }
-                html.push_str("<pre>");
-                for (offset, code_line) in self.blocks[index..end].iter().enumerate() {
-                    if offset > 0 {
-                        html.push('\n');
+                if block.code_language.is_empty() {
+                    html.push_str("<pre>");
+                    for (offset, code_line) in self.blocks[index..end].iter().enumerate() {
+                        if offset > 0 {
+                            html.push('\n');
+                        }
+                        html.push_str(&editor_runs(code_line));
                     }
-                    html.push_str(&editor_runs(code_line));
+                    html.push_str("</pre>");
+                } else {
+                    let mut code = String::new();
+                    for (offset, code_line) in self.blocks[index..end].iter().enumerate() {
+                        if offset > 0 {
+                            code.push('\n');
+                        }
+                        code.push_str(&block_plain(code_line));
+                    }
+                    html.push_str(&code_snippet_html(&block.code_language, &code));
                 }
-                html.push_str("</pre>");
                 index = end;
                 continue;
             }
@@ -4913,7 +5054,17 @@ pub fn view_with_media(
                 content = content.push(space::vertical().height(gap));
             }
         }
-        if blank_line(block) {
+        if block.pre {
+            let mut end = index + 1;
+            while end < document.blocks.len()
+                && document.blocks[end].pre
+                && document.blocks[end].code_language == block.code_language
+            {
+                end += 1;
+            }
+            content = content.push(render_code_box(&document.blocks[index..end], prefs, theme));
+            index = end;
+        } else if blank_line(block) {
             content = content.push(space::vertical().height(f32::from(prefs.message_size) * prefs.line_height()));
             index += 1;
         } else if block.quote > 0 {
@@ -5148,6 +5299,66 @@ fn render_quote(
         .into()
 }
 
+fn block_plain(block: &Block) -> String {
+    block.runs.iter().map(|run| run.text.as_str()).collect()
+}
+
+fn code_snippet_html(language: &str, code: &str) -> String {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(code.as_bytes());
+    format!(
+        "<pre itemtype=\"http://schema.skype.com/CodeSnippet\" itemscope=\"\"><span itemprop=\"language\" itemid=\"{language}\"></span><span itemprop=\"code\" itemid=\"{encoded}\"></span></pre>"
+    )
+}
+
+fn code_snippet_payload(element: ElementRef<'_>) -> Option<(String, String)> {
+    let mut language = None;
+    let mut code = None;
+    for child in element.child_elements() {
+        let Some(prop) = child.value().attr("itemprop") else { continue; };
+        let id = child.value().attr("itemid").unwrap_or("");
+        match prop {
+            "language" => language = Some(id.to_owned()),
+            "code" => code = Some(decode_snippet_code(id)),
+            _ => {}
+        }
+    }
+    code.map(|code| (language.unwrap_or_default(), code))
+}
+
+fn decode_snippet_code(value: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn render_code_box(blocks: &[Block], prefs: &Preferences, _theme: &Theme) -> Element<'static, AppMessage> {
+    let mut code = String::new();
+    for (offset, block) in blocks.iter().enumerate() {
+        if offset > 0 {
+            code.push('\n');
+        }
+        code.push_str(&block_plain(block));
+    }
+    let language = blocks.first().map(|block| block.code_language.as_str()).unwrap_or("");
+    let label = if language.is_empty() || CodeLanguage::from_id(language).id() == language {
+        CodeLanguage::from_id(language).label().to_owned()
+    } else {
+        language.to_owned()
+    };
+    container(column![
+        text(label).size(12).font(typography::semibold()).style(ui_text(Tone::Secondary)),
+        text(code).font(Font::MONOSPACE).size(f32::from(prefs.message_size)).style(ui_text(Tone::Text)),
+    ].spacing(6))
+        .padding(12)
+        .width(Fill)
+        .style(ui_surface(Tone::Canvas, true, 6.0))
+        .into()
+}
+
 fn render_block(
     block: &Block,
     prefs: &Preferences,
@@ -5301,6 +5512,16 @@ fn table_layout_portions(
     table_column_fill_portions(&widths)
 }
 
+fn table_cell_style(theme: &Theme, background: iced::Color) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(background)),
+        border: Border::default()
+            .color(tone(theme, Tone::QuoteBar))
+            .width(1.0),
+        ..Default::default()
+    }
+}
+
 fn render_table(
     table: &Table,
     prefs: &Preferences,
@@ -5337,11 +5558,7 @@ fn render_table(
                 .spacing(TABLE_BLOCK_SPACING)
                 .width(Fill)
                 .align_x(cell.alignment.iced());
-            let cell_tone = if cell.header {
-                Tone::Hover
-            } else {
-                Tone::Surface
-            };
+            let cell_tone = if cell.header { Tone::Card } else { Tone::Canvas };
             let cell_background = cell
                 .background
                 .map(crate::appearance::rgb)
@@ -5376,13 +5593,7 @@ fn render_table(
                 .width(iced::Length::FillPortion(column_portion))
                 .padding(TABLE_CELL_PADDING)
                 .clip(true)
-                .style(move |theme| container::Style {
-                    background: Some(Background::Color(cell_background)),
-                    border: Border::default()
-                        .color(tone(theme, Tone::Border))
-                        .width(0.5),
-                    ..Default::default()
-                });
+                .style(move |theme| table_cell_style(theme, cell_background));
             cells = cells.push(rendered_cell);
             vertical_alignments.push(cell.vertical_alignment.iced());
             column += span;
@@ -5390,16 +5601,10 @@ fn render_table(
         while column < columns {
             let portion = column_portions.get(column).copied().unwrap_or(1);
             cells = cells.push(
-                container(space::Space::new())
+                container(space::vertical().height(18))
                     .width(iced::Length::FillPortion(portion))
                     .padding(TABLE_CELL_PADDING)
-                    .style(|theme| container::Style {
-                        background: Some(Background::Color(tone(theme, Tone::Surface))),
-                        border: Border::default()
-                            .color(tone(theme, Tone::Border))
-                            .width(0.5),
-                        ..Default::default()
-                    }),
+                    .style(|theme| table_cell_style(theme, tone(theme, Tone::Canvas))),
             );
             vertical_alignments.push(iced::alignment::Vertical::Top);
             column += 1;
@@ -6437,7 +6642,7 @@ mod tests {
         let text = "A👨‍👩‍👧‍👦e\u{301}Z";
         let mut formatting = ComposerFormatting::default();
         formatting.toggle_mark(1, 3, InlineMark::Bold);
-        let settings = ComposerHighlightSettings::new(text, formatting);
+        let settings = ComposerHighlightSettings::new(text, formatting, 16);
         let mut highlighter =
             <ComposerHighlighter as iced::advanced::text::Highlighter>::new(&settings);
         let runs = iced::advanced::text::Highlighter::highlight_line(&mut highlighter, text)
@@ -6458,10 +6663,24 @@ mod tests {
     }
 
     #[test]
+    fn composer_font_size_is_part_of_the_input_format() {
+        let text = "Normal maior";
+        let mut formatting = ComposerFormatting::default();
+        formatting.set_size(7, 12, 125);
+        let settings = ComposerHighlightSettings::new(text, formatting, 16);
+        let mut highlighter = <ComposerHighlighter as iced::advanced::text::Highlighter>::new(&settings);
+        let runs = iced::advanced::text::Highlighter::highlight_line(&mut highlighter, text).collect::<Vec<_>>();
+        assert_eq!(runs[0].1.size_px, 0);
+        assert_eq!(runs.last().unwrap().1.size_px, 20);
+        assert_eq!(composer_highlight_format(&runs[0].1, &Theme::Dark).size, None);
+        assert_eq!(composer_highlight_format(&runs.last().unwrap().1, &Theme::Dark).size, Some(20.0));
+    }
+
+    #[test]
     fn rich_composer_highlighter_keeps_plain_text_visible() {
         use iced::advanced::text::Highlighter;
         let text = "Teste 👋\nOutra linha";
-        let settings = ComposerHighlightSettings::new(text, ComposerFormatting::default());
+        let settings = ComposerHighlightSettings::new(text, ComposerFormatting::default(), 16);
         let mut highlighter = ComposerHighlighter::new(&settings);
         for line in text.lines() {
             let runs = highlighter.highlight_line(line).collect::<Vec<_>>();
@@ -6543,7 +6762,7 @@ mod tests {
         formatting.adjust_after_edit(text, "fn main() {\n  run();\n  more();\n}");
         assert_eq!(
             formatting.code_blocks,
-            vec![CodeBlockRange { start: 0, end: 4 }]
+            vec![CodeBlockRange { start: 0, end: 4, language: String::new() }]
         );
         let edited = Document::from_editor("fn main() {\n  run();\n  more();\n}", &formatting);
         assert!(edited.blocks.iter().all(|block| block.pre));
@@ -6551,6 +6770,24 @@ mod tests {
             Document::from_html(&document.to_html()).unwrap().blocks[0].runs[0].text,
             "fn main() {\n  run();\n}"
         );
+    }
+
+    #[test]
+    fn code_box_keeps_the_selected_language_through_html() {
+        let text = "print('ok')";
+        let mut formatting = ComposerFormatting::default();
+        assert!(formatting.toggle_code_block(text, (0, text.chars().count())));
+        formatting.code_blocks[0].language = "python".into();
+        formatting.adjust_after_edit(text, "print('ok')\nprint('next')");
+        assert_eq!(formatting.code_blocks[0].language, "python");
+        assert_eq!((formatting.code_blocks[0].start, formatting.code_blocks[0].end), (0, 2));
+        let text = "print('ok')\nprint('next')";
+        let html = Document::from_editor(text, &formatting).to_html();
+        assert!(html.contains("itemid=\"python\""));
+        let parsed = Document::from_html(&html).unwrap();
+        assert_eq!(parsed.blocks[0].code_language, "python");
+        assert_eq!(block_plain(&parsed.blocks[0]), text);
+        assert!(parsed.blocks[0].pre);
     }
 
     #[test]

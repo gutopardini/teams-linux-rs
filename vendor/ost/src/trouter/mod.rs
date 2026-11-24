@@ -662,25 +662,107 @@ fn call_delivery_event(text: &str) -> Option<crate::event_hub::TrouterEvent> {
     let address = get("url").and_then(serde_json::Value::as_str);
     let short_address = get("shortUrl").and_then(serde_json::Value::as_str);
     if address.is_none() && short_address.is_none() { return None; }
-    let is_call_agent = |address: &str| {
+    let is_call_route = |address: &str| {
+        let route = address.to_ascii_lowercase();
         address.len() <= 16384
-            && (address.contains("/callAgent/") || address.starts_with("callAgent/"))
+            && (route.contains("/callagent/")
+                || route.starts_with("callagent/")
+                || route.contains("ngcallmanager"))
             && !address.chars().any(char::is_control)
     };
-    if !address.is_some_and(is_call_agent) && !short_address.is_some_and(is_call_agent) { return None; }
+    if !address.is_some_and(is_call_route) && !short_address.is_some_and(is_call_route) { return None; }
     let raw = get("body")?;
     let body = if let Some(text) = raw.as_str() {
         let decoded = decode_event_json(text).or_else(||gunzip_base64(text).and_then(|v|decode_event_json(&v)))?;
         serde_json::from_str::<serde_json::Value>(&decoded).ok()?
     } else { raw.clone() };
     if !body.is_object() {return None;}
+    let body = normalize_call_body(body);
     let mut envelope = serde_json::Map::new();
     if let Some(address) = address { envelope.insert("url".into(), serde_json::Value::String(address.to_owned())); }
     if let Some(address) = short_address { envelope.insert("shortUrl".into(), serde_json::Value::String(address.to_owned())); }
+    let callback_url = [address, short_address].into_iter().flatten().any(is_callback_address);
+    let kind = if incoming_call_invitation(&body)
+        || (!callback_url && (contains_call_invitation(&body) || contains_call_notification(&body)))
+    {
+        crate::event_hub::TrouterEventKind::CallInvitation
+    } else {
+        crate::event_hub::TrouterEventKind::CallSignal
+    };
     envelope.insert("body".into(), body);
     let payload_json = serde_json::Value::Object(envelope).to_string();
     if payload_json.len()>1024*1024 {return None;}
-    Some(crate::event_hub::TrouterEvent {kind:crate::event_hub::TrouterEventKind::CallSignal,payload_json})
+    Some(crate::event_hub::TrouterEvent {kind,payload_json})
+}
+
+/// A call-agent push whose body is the invitation itself, not a callback for a
+/// call this client already joined. Callbacks keep names such as
+/// `callAcceptance` and stay on the call session path.
+fn is_callback_address(address: &str) -> bool {
+    let lower = address.to_ascii_lowercase();
+    ["/acceptance", "/progress", "/roster", "/call/end", "callend", "renegotiation", "addparticipant"]
+        .iter()
+        .any(|part| lower.contains(part))
+}
+
+fn invitation_object(value: &serde_json::Value) -> bool {
+    if value.is_object() {
+        return true;
+    }
+    value
+        .as_str()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .is_some_and(|parsed| parsed.is_object())
+}
+
+/// Turn a stringified invitation, or a `callNotification` wrapper, into the
+/// object the call UI already knows how to read.
+fn normalize_call_body(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(encoded) = body.as_object().and_then(|object| object.get("cp")).and_then(|value| value.as_str()) {
+        if let Some(text) = gunzip_base64(encoded) {
+            if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(&text) {
+                return normalize_call_body(decoded);
+            }
+        }
+    }
+    let Some(object) = body.as_object() else { return body };
+    if let Some(note) = object.get("callNotification").cloned() {
+        let parsed = if let Some(text) = note.as_str() {
+            serde_json::from_str::<serde_json::Value>(text).ok()
+        } else if note.is_object() {
+            Some(note)
+        } else {
+            None
+        };
+        if let Some(parsed) = parsed {
+            if contains_call_invitation(&parsed) {
+                return parsed;
+            }
+        }
+    }
+    let Some(object) = body.as_object_mut() else { return body };
+    if let Some(text) = object.get("callInvitation").and_then(|value| value.as_str()).map(str::to_owned) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+            if parsed.is_object() {
+                object.insert("callInvitation".into(), parsed);
+            }
+        }
+    }
+    body
+}
+
+fn incoming_call_invitation(body: &serde_json::Value) -> bool {
+    let Some(object) = body.as_object() else { return false };
+    let invited = object.iter().any(|(key, value)| {
+        (key.eq_ignore_ascii_case("callInvitation") && invitation_object(value))
+            || (key.eq_ignore_ascii_case("callNotification") && contains_call_notification(value))
+    });
+    if !invited { return false; }
+    const CALLBACKS: &[&str] = &[
+        "callAcceptance", "conversationUpdate", "rosterUpdate", "callEnd",
+        "mediaRenegotiation", "progress", "addParticipantSuccess", "addParticipantFailure",
+    ];
+    !object.keys().any(|key| CALLBACKS.iter().any(|known| key.eq_ignore_ascii_case(known)))
 }
 
 fn publish_event(
@@ -723,7 +805,7 @@ fn classify_event_json(text: &str) -> Option<crate::event_hub::TrouterEvent> {
 
     let normalized = decode_event_json(text)?;
     let value: serde_json::Value = serde_json::from_str(&normalized).ok()?;
-    let kind = if contains_call_invitation(&value) {
+    let kind = if contains_call_invitation(&value) || contains_call_notification(&value) {
         TrouterEventKind::CallInvitation
     } else if contains_presence_marker(&value) {
         TrouterEventKind::Presence
@@ -739,14 +821,42 @@ fn classify_event_json(text: &str) -> Option<crate::event_hub::TrouterEvent> {
     })
 }
 
+/// The live ring is `callNotification.from`, often inside a gzip `cp` wrapper.
+/// It does not carry `callInvitation`.
+fn contains_call_notification(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object.iter().any(|(key, child)| {
+            (key.eq_ignore_ascii_case("callNotification") && notification_has_caller(child))
+                || (key.eq_ignore_ascii_case("cp") && child.as_str().and_then(gunzip_base64).is_some_and(|text| {
+                    serde_json::from_str::<serde_json::Value>(&text).ok().is_some_and(|nested| contains_call_notification(&nested))
+                }))
+                || contains_call_notification(child)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(contains_call_notification),
+        serde_json::Value::String(text) => serde_json::from_str::<serde_json::Value>(text)
+            .map(|nested| contains_call_notification(&nested))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn notification_has_caller(value: &serde_json::Value) -> bool {
+    let parsed = if let Some(text) = value.as_str() {
+        serde_json::from_str::<serde_json::Value>(text).ok()
+    } else if value.is_object() {
+        Some(value.clone())
+    } else {
+        None
+    };
+    parsed.is_some_and(|note| note.get("from").is_some_and(serde_json::Value::is_object))
+}
+
 fn contains_call_invitation(value: &serde_json::Value) -> bool {
     match value {
-        serde_json::Value::Object(object) => serde_json::from_value::<calling::CallNotification>(
-            value.clone(),
-        )
-        .map(|notification| notification.call_invitation.is_some())
-        .unwrap_or(false)
-            || object.values().any(contains_call_invitation),
+        serde_json::Value::Object(object) => object.iter().any(|(key, child)| {
+            (key.eq_ignore_ascii_case("callInvitation") && invitation_object(child))
+                || contains_call_invitation(child)
+        }),
         serde_json::Value::Array(items) => items.iter().any(contains_call_invitation),
         serde_json::Value::String(text) => serde_json::from_str::<serde_json::Value>(text)
             .map(|nested| contains_call_invitation(&nested))
@@ -1402,6 +1512,44 @@ mod native_call_sink_tests {
             assert_eq!(serde_json::from_str::<serde_json::Value>(&routed.payload_json).unwrap()["body"],body);
         }
         assert!(call_delivery_event(&serde_json::json!({"resourceType":"NewMessage","resource":{"content":envelope}}).to_string()).is_none());
+        let invitation = serde_json::json!({"url":"/opaque/callAgent/session/incoming","body":{"callInvitation":{"callModalities":["audio"]},"participants":{"from":{"displayName":"Ana"}}}});
+        let routed = call_delivery_event(&invitation.to_string()).unwrap();
+        assert_eq!(routed.kind, crate::event_hub::TrouterEventKind::CallInvitation);
+        let mixed = serde_json::json!({"url":"/opaque/callAgent/session/nonce/call/acceptance/","body":{"callAcceptance":{},"callInvitation":{"callModalities":["audio"]}}});
+        assert_eq!(call_delivery_event(&mixed.to_string()).unwrap().kind, crate::event_hub::TrouterEventKind::CallSignal);
+        let ngc_body = serde_json::json!({
+            "callInvitation": {"callModalities": ["audio"], "links": {}},
+            "participants": {"from": {"displayName": "Ana"}, "to": {"id": "not-a-list"}},
+        });
+        let ngc = serde_json::json!({"url":"https://trouter.fixture/v4/session/NGCallManagerWin","body": ngc_body});
+        let routed = call_delivery_event(&ngc.to_string()).unwrap();
+        assert_eq!(routed.kind, crate::event_hub::TrouterEventKind::CallInvitation);
+        let parsed = calling::parse_call_notification(&routed.payload_json).unwrap();
+        assert_eq!(parsed.participants.unwrap().from.unwrap().display_name.as_deref(), Some("Ana"));
+        let wrapped = serde_json::json!({
+            "shortUrl": "NGCallManagerWin",
+            "body": {"callNotification": serde_json::json!({"callInvitation":{"callModalities":"audio"},"participants":{"from":{"displayName":"Ana"}}}).to_string()},
+        });
+        let routed = call_delivery_event(&wrapped.to_string()).unwrap();
+        assert_eq!(routed.kind, crate::event_hub::TrouterEventKind::CallInvitation);
+        assert_eq!(calling::parse_call_notification(&routed.payload_json).unwrap().call_invitation.unwrap().call_modalities.unwrap(), vec!["audio".to_owned()]);
+        let inner = serde_json::json!({
+            "callNotification": {"from": {"id":"8:orgid:caller","displayName":"Ana"}, "to": {"id":"8:orgid:callee"}},
+            "debugContent": {"callId":"call-77"}
+        });
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write;
+        enc.write_all(inner.to_string().as_bytes()).unwrap();
+        let cp = base64::engine::general_purpose::STANDARD.encode(enc.finish().unwrap());
+        let wire = serde_json::json!({
+            "url": "https://trouter.fixture/v4/session/NGCallManagerWin",
+            "body": serde_json::json!({"evt":107,"cp":cp}).to_string(),
+        });
+        let routed = call_delivery_event(&wire.to_string()).unwrap();
+        assert_eq!(routed.kind, crate::event_hub::TrouterEventKind::CallInvitation);
+        let parsed = calling::parse_call_notification(&routed.payload_json).unwrap();
+        assert_eq!(parsed.participants.as_ref().unwrap().from.as_ref().unwrap().display_name.as_deref(), Some("Ana"));
+        assert_eq!(parsed.debug_content.unwrap().call_id.as_deref(), Some("call-77"));
         assert!(decode_event_json(&"x".repeat(1024*1024+1)).is_none());
         let mut nested="{}".to_owned();
         use base64::Engine;
