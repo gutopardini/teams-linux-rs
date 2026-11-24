@@ -378,6 +378,30 @@ fn html_escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Preserve line breaks and repeated spaces in normal HTML message text.
+fn prose_html(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut output = String::new();
+    let mut line_start = true;
+    let mut previous_space = false;
+    for ch in normalized.chars() {
+        match ch {
+            '\n' => { output.push_str("<br>"); line_start = true; previous_space = false; }
+            ' ' => {
+                output.push_str(if line_start || previous_space { "&nbsp;" } else { " " });
+                previous_space = true;
+            }
+            '&' => { output.push_str("&amp;"); line_start = false; previous_space = false; }
+            '<' => { output.push_str("&lt;"); line_start = false; previous_space = false; }
+            '>' => { output.push_str("&gt;"); line_start = false; previous_space = false; }
+            '"' => { output.push_str("&quot;"); line_start = false; previous_space = false; }
+            '\'' => { output.push_str("&#39;"); line_start = false; previous_space = false; }
+            _ => { output.push(ch); line_start = false; previous_space = false; }
+        }
+    }
+    output
+}
+
 /// Max fenced code blocks parsed per outbound message (hostile-input
 /// cap, mirrors Swift `CodeBlocks.maxBlocks`); extra fences stay prose.
 pub const WIRE_FENCE_MAX_BLOCKS: usize = 50;
@@ -417,7 +441,7 @@ fn wire_fence_closer(line: &str, ch: char, len: usize) -> bool {
 }
 
 /// Outbound wire HTML for a composer body. Fence-less messages keep the
-/// legacy single-`<p>` shape bit-identical; each fenced block becomes a
+/// single-`<p>` shape with explicit breaks; each fenced block becomes a
 /// `<pre>` (HTML preserves its newlines/indents in every client) and
 /// surrounding prose becomes `<p>` chunks. Fence lines are consumed,
 /// info strings dropped (the wire carries no highlighter), code
@@ -425,7 +449,7 @@ fn wire_fence_closer(line: &str, ch: char, len: usize) -> bool {
 /// end of text (Swift `CodeBlocks` parity).
 pub fn build_message_html(message: &str) -> String {
     if !message.lines().any(|l| wire_fence_opener(l).is_some()) {
-        return format!("<p>{}</p>", html_escape(message));
+        return format!("<p>{}</p>", prose_html(message));
     }
     enum Seg {
         Prose(String),
@@ -472,7 +496,7 @@ pub fn build_message_html(message: &str) -> String {
                 // Whitespace-only prose renders blank either way; skip it
                 // so whole-message fences emit a lone <pre>.
                 if !t.trim().is_empty() {
-                    out.push_str(&format!("<p>{}</p>", html_escape(&t)));
+                    out.push_str(&format!("<p>{}</p>", prose_html(&t)));
                 }
             }
             Seg::Code(t) => out.push_str(&format!("<pre>{}</pre>", html_escape(&t))),
@@ -5135,22 +5159,22 @@ src="x">"#
     }
 
     // wire-pre lane: fenced blocks go out as <pre> (other clients keep
-    // indents); prose keeps the legacy single-<p> shape bit-identical.
+    // indents); prose preserves line breaks within a single paragraph.
 
     #[test]
-    fn wire_prose_unchanged_single_p() {
+    fn wire_prose_preserves_newlines_and_spacing() {
         assert_eq!(build_message_html("hi"), "<p>hi</p>");
         assert_eq!(
             build_message_html("a<b>&\"'\nline2  indented"),
-            "<p>a&lt;b&gt;&amp;&quot;&#39;\nline2  indented</p>"
+            "<p>a&lt;b&gt;&amp;&quot;&#39;<br>line2 &nbsp;indented</p>"
         );
         // Inline backticks and short runs are not fences.
         assert_eq!(build_message_html("use `x` here"), "<p>use `x` here</p>");
-        assert_eq!(build_message_html("a\n``\nb"), "<p>a\n``\nb</p>");
+        assert_eq!(build_message_html("a\n``\nb"), "<p>a<br>``<br>b</p>");
         // Info string containing the fence char: not a fence (CommonMark).
         assert_eq!(
             build_message_html("``` `x` ```\nstill prose"),
-            "<p>``` `x` ```\nstill prose</p>"
+            "<p>``` `x` ```<br>still prose</p>"
         );
     }
 
@@ -5213,7 +5237,7 @@ src="x">"#
         let html = build_message_html(&msg);
         assert_eq!(html.matches("<pre>").count(), WIRE_FENCE_MAX_BLOCKS);
         // 51st block never parsed: its fences stay literal prose, nothing lost.
-        assert!(html.contains("```\nc50\n```"), "{}", html);
+        assert!(html.contains("```<br>c50<br>```"), "{}", html);
     }
 
     #[test]

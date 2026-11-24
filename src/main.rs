@@ -12886,7 +12886,6 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         state.status = tr("The draft changed during paste. Copy again in the current chat.").into();
                         return Task::none();
                     }
-                    let text = message_body::auto_format_pasted_text(&text);
                     if state.composer_uses_editor() || text.contains('\n') {
                         return state.insert_clipboard_document(
                             target,
@@ -12917,7 +12916,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
                         return state.insert_clipboard_document(
                             target,
                             message_body::ComposerPaste {
-                                text: message_body::auto_format_pasted_text(&plain),
+                                text: plain,
                                 formatting: message_body::ComposerFormatting::default(),
                             },
                             true,
@@ -23439,6 +23438,24 @@ mod tests {
         assert!(formatting.links.iter().any(|range| {
             range.start == 12 && range.end == 16 && range.url == "https://example.com/docs"
         }));
+    }
+
+    #[test]
+    fn pasted_plain_text_keeps_blank_lines_indentation_and_sql_commands() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        let key = state.draft_key().unwrap();
+        let epoch = state.session_epoch;
+        let text = "Please review:\n\n  GRANT SELECT ON app.first TO 'reader'@'%';\n  GRANT SELECT ON app.second TO 'reader'@'%';";
+        state.clipboard_paste_target = Some(ClipboardPasteTarget {
+            epoch, draft_key: key.clone(), revision: 0, selection: (0, 0),
+        });
+        drop(update_inner(&mut state, AppMessage::ClipboardRead(
+            epoch, key, Ok(images::Paste::Text(text.to_owned())),
+        )));
+        assert_eq!(state.draft, text);
+        let html = ost::api::build_message_html(&state.draft);
+        assert!(html.contains("<br><br>&nbsp;&nbsp;GRANT SELECT"));
+        assert_eq!(html.matches("<br>").count(), 3);
     }
 
     #[test]
