@@ -26425,6 +26425,24 @@ mod tests {
     }
 
     #[test]
+    fn readers_use_server_message_id_when_client_id_differs() {
+        let messages = vec![
+            GraphMessage { id: "server-1".into(), is_mine: true, ..Default::default() },
+            GraphMessage { id: "server-2".into(), is_mine: true, ..Default::default() },
+            GraphMessage { id: "server-3".into(), is_mine: true, ..Default::default() },
+        ];
+        let value = serde_json::json!({"consumptionhorizons": [
+            {"id": "8:orgid:peer", "consumptionhorizon": "server-2;12345;other-client-id"}
+        ]});
+        let receipts = ost::api::parse_consumptionhorizons(&value);
+        let names = HashMap::from([("peer".to_string(), "Alex".to_string())]);
+        let readers = read_receipt_readers(&messages, &receipts, "me", &names);
+        assert_eq!(readers.get("server-1"), Some(&vec!["Alex".to_owned()]));
+        assert_eq!(readers.get("server-2"), Some(&vec!["Alex".to_owned()]));
+        assert!(!readers.contains_key("server-3"));
+    }
+
+    #[test]
     fn unread_separator_starts_at_first_incoming_message_after_known_frontier() {
         let messages = vec![
             GraphMessage {

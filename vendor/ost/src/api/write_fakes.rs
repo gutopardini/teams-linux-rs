@@ -223,7 +223,7 @@ async fn read_receipts_get_returns_only_server_reported_horizons() {
         route,
         200,
         json!({"consumptionhorizons": [
-            {"mri":"8:orgid:peer", "consumptionhorizon":"10;10;message-7"}
+            {"mri":"8:orgid:peer", "consumptionhorizon":"message-7;10;client-message-7"}
         ]})
         .to_string(),
     )])

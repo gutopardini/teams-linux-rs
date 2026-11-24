@@ -1364,7 +1364,7 @@ pub async fn leave_chat(chat_id: &str) -> Result<()> {
 //
 // Wire shape mirrors the native chat service consumption horizon:
 // PUT .../v1/users/ME/conversations/{id}/properties?name=consumptionhorizon
-// with {"consumptionhorizon": "<t1>;<t2>;<messageId>"} marks read;
+// with {"consumptionhorizon": "<messageId>;<readTime>;<clientMessageId>"} marks read;
 // GET .../v1/threads/{id}/consumptionhorizons lists peer positions.
 
 /// One peer read position: user key + last-read message id.
@@ -1411,11 +1411,11 @@ pub fn consumptionhorizon_body(message_id: &str, now_ms: u64) -> serde_json::Val
     serde_json::json!({ "consumptionhorizon": consumptionhorizon_value(message_id, now_ms) })
 }
 
-/// Message id from a horizon value: text after the last ';'.
-/// Empty/blank horizons yield None (caller drops the entry).
+/// The first horizon component is the server message id; the last component
+/// is the client message id and can differ between clients.
 pub fn receipt_message_id(horizon: &str) -> Option<String> {
-    let id = horizon.rsplit(';').next()?.trim();
-    if id.is_empty() {
+    let id = horizon.split(';').next()?.trim();
+    if id.is_empty() || id == "0" {
         return None;
     }
     Some(id.to_string())
@@ -5035,22 +5035,23 @@ src="x">"#
     }
 
     #[test]
-    fn receipt_message_id_splits_last_segment() {
-        assert_eq!(receipt_message_id("1;2;m42").as_deref(), Some("m42"));
+    fn receipt_message_id_uses_server_id_not_client_id() {
+        assert_eq!(receipt_message_id("m42;2;client42").as_deref(), Some("m42"));
         assert_eq!(receipt_message_id("m42").as_deref(), Some("m42"));
-        assert_eq!(receipt_message_id(" 1;2; m42 ").as_deref(), Some("m42"));
+        assert_eq!(receipt_message_id(" m42 ;2; client42 ").as_deref(), Some("m42"));
         assert_eq!(receipt_message_id(""), None);
         assert_eq!(receipt_message_id("   "), None);
-        assert_eq!(receipt_message_id("1;2;"), None);
+        assert_eq!(receipt_message_id("0;0;0"), None);
+        assert_eq!(receipt_message_id(";2;client42"), None);
     }
 
     #[test]
     fn receipt_parse_tolerates_shapes() {
         let v: serde_json::Value = serde_json::from_str(
             r#"{"id":"19:t@thread.v2","version":"1","consumptionhorizons":[
-                {"mri":"8:orgid:a","consumptionhorizon":"1;2;m1"},
-                {"user":"Bo","consumptionhorizon":"3;4;m2"},
-                "5;6;m3",
+                {"mri":"8:orgid:a","consumptionhorizon":"m1;2;client1"},
+                {"user":"Bo","consumptionhorizon":"m2;4;client2"},
+                "m3;6;client3",
                 {"mri":"8:orgid:bad","consumptionhorizon":""},
                 {"mri":"8:orgid:nohorizon"}
             ]}"#,
@@ -5063,7 +5064,7 @@ src="x">"#
             ReadReceipt {
                 user: "8:orgid:a".to_string(),
                 message_id: "m1".to_string(),
-                horizon: "1;2;m1".to_string(),
+                horizon: "m1;2;client1".to_string(),
             }
         );
         assert_eq!(out[1].user, "Bo");
