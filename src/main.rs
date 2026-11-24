@@ -2491,6 +2491,7 @@ enum Icon {
     StatusNote,
     WorkLocation,
     Check,
+    Eye,
     Reaction,
     Reply,
     Copy,
@@ -2577,6 +2578,7 @@ fn icon_tone(icon_type: Icon, role: Tone, size: f32) -> Element<'static, AppMess
         Icon::StatusNote => include_bytes!("../assets/icons/status-note.svg"),
         Icon::WorkLocation => include_bytes!("../assets/icons/work-location.svg"),
         Icon::Check => include_bytes!("../assets/icons/check.svg"),
+        Icon::Eye => include_bytes!("../assets/icons/eye.svg"),
         Icon::Reaction => include_bytes!("../assets/icons/reaction.svg"),
         Icon::Reply => include_bytes!("../assets/icons/reply.svg"),
         Icon::Copy => include_bytes!("../assets/icons/copy.svg"),
@@ -3054,18 +3056,43 @@ fn read_receipt_marker_indices(
                 && (current_user.is_empty()
                     || reaction_identity(&receipt.user) != current_user)
         })
-        .filter_map(|receipt| {
-            let frontier = messages
+        .flat_map(|receipt| {
+            let Some(frontier) = messages
                 .iter()
-                .position(|message| message.id == receipt.message_id)?;
+                .position(|message| message.id == receipt.message_id)
+            else {
+                return Vec::new();
+            };
             messages[..=frontier]
                 .iter()
                 .enumerate()
-                .rev()
-                .find(|(_, message)| message.is_mine && !message.id.starts_with("local:"))
+                .filter(|(_, message)| message.is_mine && !message.id.starts_with("local:"))
                 .map(|(index, _)| index)
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn outgoing_message_status_marker(seen: bool) -> Element<'static, AppMessage> {
+    let marker: Element<'static, AppMessage> = if seen {
+        icon_tone(Icon::Eye, Tone::Accent, 15.0)
+    } else {
+        container(icon_tone(Icon::Check, Tone::Accent, 9.0))
+            .width(14.0)
+            .height(14.0)
+            .center_x(14.0)
+            .center_y(14.0)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::TRANSPARENT)),
+                border: Border::default()
+                    .rounded(7.0)
+                    .width(1.25)
+                    .color(rgb(0x7b83eb)),
+                ..Default::default()
+            })
+            .into()
+    };
+    hint(marker, tr(if seen { "Seen" } else { "Delivered" }))
 }
 
 fn unread_separator_index(
@@ -7638,17 +7665,13 @@ impl TeamsApp {
                 );
                 message_content = message_content.push(thread_actions);
             }
-            if read_markers.contains(&index) {
-                message_content = message_content.push(
-                    container(space::horizontal())
-                        .width(10)
-                        .height(10)
-                        .style(|_| container::Style {
-                            background: Some(Background::Color(Color::TRANSPARENT)),
-                            border: Border::default().rounded(5.0).width(1.5).color(rgb(0x7b83eb)),
-                            ..Default::default()
-                        }),
-                );
+            if self.section == Section::Chats
+                && message.is_mine
+                && !message.is_deleted
+                && !message.id.starts_with("local:")
+            {
+                message_content = message_content
+                    .push(outgoing_message_status_marker(read_markers.contains(&index)));
             }
             let important = message_priority_label(message.importance).is_some();
             let message_row: Element<'_, AppMessage> = if message.is_mine && self.section == Section::Chats {
@@ -26310,7 +26333,7 @@ mod tests {
     }
 
     #[test]
-    fn read_receipt_marks_only_the_latest_own_message_with_a_known_peer_frontier() {
+    fn read_receipt_marks_own_messages_through_a_known_peer_frontier() {
         let messages = vec![
             GraphMessage {
                 id: "out-1".into(),
@@ -26334,7 +26357,7 @@ mod tests {
         }];
         assert_eq!(
             read_receipt_marker_indices(&messages, &receipts, "me"),
-            HashSet::from([1])
+            HashSet::from([0, 1])
         );
         let self_receipt = vec![ost::api::ReadReceipt {
             user: "8:orgid:ME".into(),
