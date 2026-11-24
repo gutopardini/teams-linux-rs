@@ -109,7 +109,11 @@ impl AccessToken {
     }
 
     fn valid(&self) -> bool {
-        self.expires_at > Instant::now() + Duration::from_secs(60)
+        self.valid_for(Duration::from_secs(60))
+    }
+
+    fn valid_for(&self, minimum_remaining: Duration) -> bool {
+        self.expires_at > Instant::now() + minimum_remaining
     }
 
     fn remaining(&self) -> u64 {
@@ -683,7 +687,12 @@ impl TeamsSession {
     }
 
     fn ensure_skype(&self, tokens: &mut TokenSet) -> Result<(), String> {
-        if tokens.skype.as_ref().is_some_and(AccessToken::valid) {
+        // The native Teams client treats Skype tokens with five minutes or
+        // less remaining as expired. Refresh before handing one to that
+        // client, rather than failing a history page after its cursor is read.
+        if tokens.skype.as_ref().is_some_and(|token| {
+            token.valid_for(Duration::from_secs(6 * 60))
+        }) {
             return Ok(());
         }
         if !tokens.aad.valid() {
