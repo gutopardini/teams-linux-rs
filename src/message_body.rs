@@ -1188,6 +1188,16 @@ impl ComposerFormatting {
         true
     }
 
+    pub fn has_code_block(&self, text: &str, selection: (usize, usize)) -> bool {
+        let (start, end) = selected_lines(text, selection);
+        start < end && self.code_blocks.iter().any(|range| range.start <= start && range.end >= end)
+    }
+
+    pub fn has_list(&self, text: &str, selection: (usize, usize), kind: ListKind) -> bool {
+        let (start, end) = selected_lines(text, selection);
+        start < end && self.lists.iter().any(|range| range.start <= start && range.end >= end && range.kind == kind)
+    }
+
     /// Toggle a block quotation for every line touched by the selection.
     /// Quoting is line-oriented, just like lists and code blocks in Rusty
     /// Teams. Applying it also removes list/code markers from those lines so
@@ -1406,7 +1416,7 @@ impl ComposerFormatting {
             .code_blocks
             .drain(..)
             .flat_map(|range| {
-                remap_covered_range(range.start, range.end, prefix, old_end, new_end)
+                remap_editable_block_range(range.start, range.end, prefix, old_end, new_end)
                     .into_iter()
                     .map(|(start, end)| CodeBlockRange { start, end })
             })
@@ -1416,7 +1426,7 @@ impl ComposerFormatting {
             .quote_blocks
             .drain(..)
             .flat_map(|range| {
-                remap_covered_range(range.start, range.end, prefix, old_end, new_end)
+                remap_editable_block_range(range.start, range.end, prefix, old_end, new_end)
                     .into_iter()
                     .map(|(start, end)| QuoteRange { start, end })
             })
@@ -1482,7 +1492,16 @@ impl ComposerFormatting {
         let old_graphemes = old.graphemes(true).collect::<Vec<_>>();
         let new_graphemes = new.graphemes(true).collect::<Vec<_>>();
         let (inserted_start, _, inserted_end) = common_edit(&old_graphemes, &new_graphemes);
+        let edited_line = old_graphemes.iter().take(inserted_start).filter(|g| **g == "\n").count();
+        let active_list = self.lists.iter().find(|range| range.start <= edited_line && edited_line < range.end)
+            .map(|range| range.kind);
         self.adjust_after_edit(old, new);
+        if let Some(kind) = active_list {
+            let start = new_graphemes.iter().take(inserted_start).filter(|g| **g == "\n").count();
+            let end = new_graphemes.iter().take(inserted_end).filter(|g| **g == "\n").count() + 1;
+            self.lists.push(ListRange { start, end, kind });
+            normalize_lists(&mut self.lists);
+        }
         if inserted_start >= inserted_end {
             return;
         }
@@ -1577,6 +1596,15 @@ fn remap_covered_range(
         return vec![(start, (end as isize + delta).max(0) as usize)];
     }
     remap_range(start, end, prefix, old_end, new_end)
+}
+
+fn remap_editable_block_range(
+    start: usize, end: usize, prefix: usize, old_end: usize, new_end: usize,
+) -> Vec<(usize, usize)> {
+    if start < end && end == prefix && old_end == prefix && new_end > old_end {
+        return vec![(start, end + new_end - old_end)];
+    }
+    remap_covered_range(start, end, prefix, old_end, new_end)
 }
 
 fn split_line_range(
@@ -1834,7 +1862,7 @@ fn selected_lines(text: &str, selection: (usize, usize)) -> (usize, usize) {
 
     let graphemes = text.graphemes(true).collect::<Vec<_>>();
     let (start, end) = selection;
-    if start >= end || start >= graphemes.len() {
+    if start > end || end > graphemes.len() {
         return (0, 0);
     }
     let line_at = |index: usize| {
@@ -1844,6 +1872,7 @@ fn selected_lines(text: &str, selection: (usize, usize)) -> (usize, usize) {
             .filter(|grapheme| **grapheme == "\n")
             .count()
     };
+    if start == end { return (line_at(start), line_at(start) + 1); }
     (line_at(start), line_at(end - 1) + 1)
 }
 impl Default for Style {

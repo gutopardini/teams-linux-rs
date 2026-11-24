@@ -70,6 +70,7 @@ mod emoji;
 mod emoji_picker;
 mod composer_popover;
 mod paste;
+mod draft_history;
 mod performance;
 mod performance_ui;
 mod window_chrome;
@@ -896,6 +897,8 @@ enum AppMessage {
     ),
     MessagesLoaded(u64, u64, String, Result<(TeamsSession, MessagePage), String>),
     DraftChanged(String),
+    UndoDraft,
+    RedoDraft,
     MentionMembersLoaded(u64,u64,String,Result<(TeamsSession,Vec<ChatMemberSummary>),String>),
     MentionPick(mention_composer::Entry),
     MentionNavigate(i32),
@@ -2193,6 +2196,7 @@ struct TeamsApp {
     startup_phase: u16,
     drafts: HashMap<String, String>,
     draft_formatting: HashMap<String, message_body::ComposerFormatting>,
+    draft_history: draft_history::History,
     draft_active_marks: HashMap<String, HashSet<message_body::InlineMark>>,
     draft_active_sizes: HashMap<String, u16>,
     draft_active_colors: HashMap<String, u32>,
@@ -5044,6 +5048,7 @@ impl TeamsApp {
     }
 
     fn restore_draft(&mut self) {
+        self.draft_history.reset();
         self.draft = self
             .draft_key()
             .and_then(|key| self.drafts.get(&key).cloned())
@@ -5074,6 +5079,40 @@ impl TeamsApp {
         self.draft_key()
             .and_then(|key| self.draft_formatting.get(&key).cloned())
             .unwrap_or_default()
+    }
+
+    fn undo_snapshot(&self) -> draft_history::Snapshot {
+        draft_history::Snapshot { text: self.draft.clone(), formatting: self.active_formatting() }
+    }
+
+    fn record_draft_undo(&mut self) {
+        if let Some(key) = self.draft_key() {
+            let snapshot = self.undo_snapshot();
+            self.draft_history.record(&key, snapshot);
+        }
+    }
+
+    fn step_draft_history(&mut self, redo: bool) -> Task<AppMessage> {
+        let Some(key) = self.draft_key() else { return Task::none(); };
+        let current = self.undo_snapshot();
+        let Some(snapshot) = self.draft_history.step(&key, current.clone(), redo) else { return Task::none(); };
+        let cursor = mention_composer::edit_cursor(&current.text, &snapshot.text);
+        self.draft = snapshot.text;
+        self.draft_formatting.insert(key.clone(), snapshot.formatting);
+        self.composer_content = crate::composer_decorations::Content::with_text(&self.draft);
+        self.composer_content.move_to(message_body::editor_cursor_at(&self.draft, cursor));
+        self.draft_selection = None;
+        self.composer_superseded = None;
+        self.link_editor_open = false;
+        self.link_target = None;
+        self.mention_composer.caret = cursor;
+        self.sync_active_marks_from_range(key.clone(), (cursor, cursor));
+        let revision = self.draft_versions.entry(key).or_insert(0);
+        *revision = revision.wrapping_add(1);
+        self.remember_draft();
+        self.mark_drafts_dirty();
+        let mentions = sync_composer_mentions(self);
+        Task::batch([mentions, self.restore_composer_selection((cursor, cursor))])
     }
 
     fn sync_active_marks_from_range(&mut self, key: String, range: (usize, usize)) {
@@ -5277,6 +5316,7 @@ impl TeamsApp {
         if sent.is_empty() || self.draft_key().as_deref() != Some(key) || self.draft != sent {
             return;
         }
+        self.draft_history.reset();
         self.mention_composer.close();self.mention_composer.editor=false;self.mention_composer.caret=0;
         self.composer_superseded = Some(sent.to_owned());
         self.draft.clear();
@@ -5434,6 +5474,7 @@ impl TeamsApp {
             startup_phase: 0,
             drafts: HashMap::new(),
             draft_formatting: HashMap::new(),
+            draft_history: draft_history::History::default(),
             draft_active_marks: HashMap::new(),
             draft_active_sizes: HashMap::new(),
             draft_active_colors: HashMap::new(),
@@ -11042,7 +11083,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
     let send_started = matches!(&message, AppMessage::SendMessage | AppMessage::ComposerSettled);
     let composer_only = matches!(&message,
         AppMessage::MessageEditAction(_) | AppMessage::MessageEditTextChanged(_) | AppMessage::ToggleEditFormatting | AppMessage::ApplyEditMark(_)
-        | AppMessage::MeetingCameraTick | AppMessage::StartupPulse | AppMessage::PerformancePulse | AppMessage::DraftChanged(_) | AppMessage::DraftAction(_)
+        | AppMessage::MeetingCameraTick | AppMessage::StartupPulse | AppMessage::PerformancePulse | AppMessage::DraftChanged(_) | AppMessage::DraftAction(_) | AppMessage::UndoDraft | AppMessage::RedoDraft
         | AppMessage::NativeCallPulse(..) | AppMessage::NativeCallMute(_) | AppMessage::NativeCallVolume(_) | AppMessage::ToggleNativeCamera | AppMessage::RetryNativeCamera
         | AppMessage::ToggleCallPanel(_) | AppMessage::CloseCallPanel | AppMessage::MeetingParticipantSearch(_)
         | AppMessage::MeetingGalleryStep(_)
@@ -11080,7 +11121,7 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
     let skip_avatar_refresh = composer_only || gif_animation_tick || matches!(
         &message,
         AppMessage::MeetingCameraTick | AppMessage::DraftChanged(_)
-            | AppMessage::DraftAction(_)
+            | AppMessage::DraftAction(_) | AppMessage::UndoDraft | AppMessage::RedoDraft
             | AppMessage::DraftSelectionChanged(_, _)
             | AppMessage::DraftFontSizeSelected(_)
             | AppMessage::DraftTextColorSelected(_)
@@ -11103,8 +11144,21 @@ fn update_impl(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         |AppMessage::SelectConversation(_)|AppMessage::GroupMembersLoaded(..)
         |AppMessage::AvatarLoaded(_,AvatarTarget::Chat(_)|AvatarTarget::Group(_),_));
     let history_revision=state.chat_render_revision;
+    let format_history = matches!(&message,
+        AppMessage::ApplyDraftMark(_) | AppMessage::DraftFontSizeSelected(_)
+        | AppMessage::DraftTextColorSelected(_) | AppMessage::DraftHighlightSelected(_)
+        | AppMessage::ClearDraftHighlight | AppMessage::ToggleDraftList(_)
+        | AppMessage::ToggleDraftCodeBlock | AppMessage::ToggleDraftQuote
+        | AppMessage::InsertDraftTable { .. } | AppMessage::ClearDraftFormatting
+        | AppMessage::ApplyDraftLink).then(|| (state.draft_key(), state.undo_snapshot()));
     let refresh_draft_rows=state.chat_list_filter==ChatListFilter::Drafts&&matches!(&message,AppMessage::DraftChanged(_)|AppMessage::DraftAction(_));
     let task = update_inner(state, message);
+    if let Some((Some(key), before)) = format_history
+        && state.draft_key().as_deref() == Some(key.as_str())
+        && state.undo_snapshot() != before
+    {
+        state.draft_history.record(&key, before);
+    }
     if identity_update && chat_identity::repair_titles(state) {
         state.chat_render_revision=state.chat_render_revision.wrapping_add(1);
         state.chat_list_revision=state.chat_list_revision.wrapping_add(1);
@@ -17652,9 +17706,12 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.remember_draft();state.mark_drafts_dirty();
             Task::batch([task,iced::widget::operation::focus("message-composer-rich")])
         }
+        AppMessage::UndoDraft => state.step_draft_history(false),
+        AppMessage::RedoDraft => state.step_draft_history(true),
         AppMessage::DraftChanged(draft) => {
             let draft = state.without_superseded_prefix(draft);
             let changed = state.draft != draft;
+            if changed { state.record_draft_undo(); }
             let was_editor=state.composer_uses_editor();
             let mention_caret=mention_composer::edit_cursor(&state.draft,&draft);
             if let Some(key) = state.draft_key() {
@@ -17732,6 +17789,7 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             let draft = state.composer_content.text();
             let changed = draft != previous;
             if changed {
+                state.record_draft_undo();
                 if let Some(key) = state.draft_key() {
                     state
                         .draft_formatting
@@ -17814,10 +17872,9 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
             state.link_editor_open = false;
             state.link_target = None;
             state.link_url.clear();
-            state.selected_draft_range().map_or_else(
-                || iced::widget::operation::focus("message-composer"),
-                |selection| state.restore_composer_selection(selection),
-            )
+            let selection = state.selected_draft_range().unwrap_or_else(||
+                message_body::editor_cursor_range(&state.draft, state.composer_content.cursor()));
+            state.restore_composer_selection(selection)
         }
         AppMessage::ToggleComposerEmoji => {
             if state.editing_message_id.is_some() || !(state.drafts_loaded || state.demo_mode) {
@@ -18010,10 +18067,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::ToggleDraftList(kind) => {
             state.composer_menu = None;
-            let (Some(key), Some(selection)) = (state.draft_key(), state.selected_draft_range())
-            else {
-                return Task::none();
-            };
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            let selection = state.selected_draft_range().unwrap_or_else(|| message_body::editor_cursor_range(&state.draft, state.composer_content.cursor()));
             state.draft_formatting.entry(key).or_default().toggle_list(
                 &state.draft,
                 selection,
@@ -18024,10 +18079,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::ToggleDraftCodeBlock => {
             state.composer_menu = None;
-            let (Some(key), Some(selection)) = (state.draft_key(), state.selected_draft_range())
-            else {
-                return Task::none();
-            };
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            let selection = state.selected_draft_range().unwrap_or_else(|| message_body::editor_cursor_range(&state.draft, state.composer_content.cursor()));
             state
                 .draft_formatting
                 .entry(key)
@@ -18038,10 +18091,8 @@ fn update_inner(state: &mut TeamsApp, message: AppMessage) -> Task<AppMessage> {
         }
         AppMessage::ToggleDraftQuote => {
             state.composer_menu = None;
-            let (Some(key), Some(selection)) = (state.draft_key(), state.selected_draft_range())
-            else {
-                return Task::none();
-            };
+            let Some(key) = state.draft_key() else { return Task::none(); };
+            let selection = state.selected_draft_range().unwrap_or_else(|| message_body::editor_cursor_range(&state.draft, state.composer_content.cursor()));
             state
                 .draft_formatting
                 .entry(key)
@@ -20664,14 +20715,114 @@ fn view_impl(state: &TeamsApp) -> Element<'_, AppMessage> {
         {
             Some(AppMessage::CloseChatListSearch)
         } else {
-            None
+            formatting_escape_action(state)
         },
     ))
+}
+
+fn formatting_escape_action(state: &TeamsApp) -> Option<AppMessage> {
+    if !state.formatting_open || state.settings_open || state.message_search_open
+        || state.message_menu_for.is_some() || state.new_conversation_open
+        || state.group_details_open || state.image_viewer.is_some() || state.profile_menu_open
+        || state.status_note_open || state.person_card.is_some() || state.app_menu.surface.is_some()
+    { return None; }
+    if state.link_editor_open || state.composer_menu.is_some() || state.composer_emoji_open {
+        Some(AppMessage::CloseComposerMenu)
+    } else {
+        Some(AppMessage::ToggleFormatting)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_closes_composer_popover_then_formatting_without_losing_draft() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        drop(update(&mut state, AppMessage::DraftChanged("Example\nsecond line".into())));
+        state.formatting_open = true;
+        state.composer_menu = Some(composer_ui::Menu::More);
+        assert!(matches!(formatting_escape_action(&state), Some(AppMessage::CloseComposerMenu)));
+        drop(update(&mut state, AppMessage::CloseComposerMenu));
+        assert!(matches!(formatting_escape_action(&state), Some(AppMessage::ToggleFormatting)));
+        drop(update(&mut state, AppMessage::ToggleFormatting));
+        assert!(!state.formatting_open);
+        assert_eq!(state.draft, "Example\nsecond line");
+        assert!(state.composer_uses_editor());
+        assert!(formatting_escape_action(&state).is_none());
+    }
+
+    #[test]
+    fn composer_undo_redo_restores_text_formatting_and_isolated_drafts() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        drop(update(&mut state, AppMessage::DraftChanged("Hello".into())));
+        drop(update(&mut state, AppMessage::DraftChanged("Hello world".into())));
+        drop(update(&mut state, AppMessage::UndoDraft));
+        assert_eq!(state.draft, "Hello");
+        drop(update(&mut state, AppMessage::RedoDraft));
+        assert_eq!(state.draft, "Hello world");
+        state.formatting_open = true;
+        state.composer_content = crate::composer_decorations::Content::with_text(&state.draft);
+        let key = state.draft_key().unwrap();
+        state.draft_selection = Some((key, 0, 5));
+        drop(update(&mut state, AppMessage::ApplyDraftMark(message_body::InlineMark::Bold)));
+        assert!(state.active_formatting().has_mark(0, 5, message_body::InlineMark::Bold));
+        drop(update(&mut state, AppMessage::UndoDraft));
+        assert!(!state.active_formatting().has_mark(0, 5, message_body::InlineMark::Bold));
+        drop(update(&mut state, AppMessage::RedoDraft));
+        assert!(state.active_formatting().has_mark(0, 5, message_body::InlineMark::Bold));
+        drop(update(&mut state, AppMessage::UndoDraft));
+        drop(update(&mut state, AppMessage::DraftChanged("Different".into())));
+        drop(update(&mut state, AppMessage::RedoDraft));
+        assert_eq!(state.draft, "Different");
+        state.selected_chat = Some("other-chat".into());
+        state.restore_draft();
+        drop(update(&mut state, AppMessage::UndoDraft));
+        assert!(state.draft.is_empty());
+    }
+
+    #[test]
+    fn undo_redo_restores_a_multiline_paste_with_unicode() {
+        let mut state = TeamsApp::from_client_id(String::new());
+        state.demo_mode = true;
+        drop(update(&mut state, AppMessage::DraftChanged("Start ".into())));
+        let key = state.draft_key().unwrap();
+        let epoch = state.session_epoch;
+        let revision = *state.draft_versions.get(&key).unwrap();
+        state.clipboard_paste_target = Some(ClipboardPasteTarget {
+            epoch, draft_key: key.clone(), revision, selection: (6, 6),
+        });
+        drop(update(&mut state, AppMessage::ClipboardRead(epoch, key,
+            Ok(images::Paste::Text("Olá 👩‍💻\nnext line".into())))));
+        assert_eq!(state.draft, "Start Olá 👩‍💻\nnext line");
+        drop(update(&mut state, AppMessage::UndoDraft));
+        assert_eq!(state.draft, "Start ");
+        drop(update(&mut state, AppMessage::RedoDraft));
+        assert_eq!(state.draft, "Start Olá 👩‍💻\nnext line");
+    }
+
+    #[test]
+    fn code_block_and_lists_can_be_started_at_an_empty_cursor() {
+        for (action, is_code) in [(AppMessage::ToggleDraftCodeBlock, true),
+            (AppMessage::ToggleDraftList(message_body::ListKind::Unordered), false)] {
+            let mut state = TeamsApp::from_client_id(String::new());
+            state.demo_mode = true;
+            state.formatting_open = true;
+            drop(update(&mut state, action));
+            drop(update(&mut state, AppMessage::DraftAction(text_editor::Action::Edit(text_editor::Edit::Insert('x')))));
+            let document = message_body::Document::from_editor(&state.draft, &state.active_formatting());
+            if is_code { assert_eq!(document.to_html(), "<pre><code>x</code></pre>"); }
+            else { assert!(document.to_html().contains("<ul>"), "draft={:?}, formatting={:?}, html={}", state.draft, state.active_formatting(), document.to_html()); }
+            drop(update(&mut state, AppMessage::DraftAction(text_editor::Action::Edit(text_editor::Edit::Enter))));
+            drop(update(&mut state, AppMessage::DraftAction(text_editor::Action::Edit(text_editor::Edit::Insert('y')))));
+            let html = message_body::Document::from_editor(&state.draft, &state.active_formatting()).to_html();
+            if is_code { assert_eq!(html, "<pre><code>x</code>\n<code>y</code></pre>"); }
+            else { assert_eq!(html.matches("<li>").count(), 2, "{html}"); }
+        }
+    }
 
     #[test]
     fn initials_avatars_use_the_outer_names_and_handle_a_single_name() {

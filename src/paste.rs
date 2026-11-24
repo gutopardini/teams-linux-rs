@@ -375,6 +375,18 @@ fn rich_composer_shortcut(event: &Event) -> Option<AppMessage> {
     }
 }
 
+fn draft_history_shortcut(event: &Event) -> Option<AppMessage> {
+    let Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key, physical_key, modifiers, repeat: false, ..
+    }) = event else { return None; };
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() { return None; }
+    match (key.to_latin(*physical_key).map(|ch| ch.to_ascii_lowercase()), modifiers.shift()) {
+        (Some('z'), false) => Some(AppMessage::UndoDraft),
+        (Some('z'), true) | (Some('y'), false) => Some(AppMessage::RedoDraft),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct State {
     context: String,
@@ -626,6 +638,17 @@ impl<R: iced::advanced::text::Renderer> Widget<AppMessage, Theme, R> for Observe
                     // tree while the clipboard read was in flight.
                     shell.publish(AppMessage::TextPasteFinished(*version, true));
                 }
+            }
+        }
+        if self.image_url.is_none() && self.shortcuts.is_none()
+            && let Some(message) = draft_history_shortcut(event)
+        {
+            let mut focus = Focus::default();
+            self.inner.as_widget_mut().operate(&mut tree.children[0], layout, renderer, &mut focus);
+            if focus.0 {
+                shell.publish(message);
+                shell.capture_event();
+                return;
             }
         }
         if self.rich_editor {
@@ -1346,6 +1369,11 @@ mod tests {
             })
         };
 
+        assert!(matches!(draft_history_shortcut(&character("z", Code::KeyZ, Modifiers::CTRL)), Some(AppMessage::UndoDraft)));
+        assert!(matches!(draft_history_shortcut(&character("z", Code::KeyZ, Modifiers::CTRL | Modifiers::SHIFT)), Some(AppMessage::RedoDraft)));
+        assert!(matches!(draft_history_shortcut(&character("y", Code::KeyY, Modifiers::CTRL)), Some(AppMessage::RedoDraft)));
+        assert!(draft_history_shortcut(&character("z", Code::KeyZ, Modifiers::CTRL | Modifiers::ALT)).is_none());
+
         assert!(matches!(
             rich_composer_shortcut(&character("b", Code::KeyB, Modifiers::CTRL)),
             Some(AppMessage::ApplyDraftMark(crate::message_body::InlineMark::Bold))
@@ -1401,6 +1429,36 @@ mod tests {
         ));
         assert!(shortcut_with_search(&escape, false, false, false, false, false, false, false)
             .is_none());
+    }
+
+    #[test]
+    fn undo_shortcut_only_targets_the_focused_composer() {
+        use iced::keyboard::{Event as KeyEvent, Key, Location, Modifiers, key::{Code, Physical}};
+        let input: Element<'_, AppMessage, Theme, ()> = iced::widget::text_input("", "hello")
+            .on_input(AppMessage::DraftChanged).into();
+        let mut widget = Observed {
+            inner: input, context: "chat:test".into(), text: None, image_url: None,
+            value: "hello".into(), shortcuts: None, rich_editor: false,
+            shortcuts_suspended: false, search_escape: None,
+        };
+        let mut tree = Tree::new(&widget as &dyn Widget<AppMessage, Theme, ()>);
+        let node = widget.layout(&mut tree, &(), &layout::Limits::new(Size::ZERO, Size::new(400.0, 60.0)));
+        let event = Event::Keyboard(KeyEvent::KeyPressed {
+            key: Key::Character("z".into()), modified_key: Key::Character("z".into()),
+            physical_key: Physical::Code(Code::KeyZ), location: Location::Standard,
+            modifiers: Modifiers::CTRL, text: None, repeat: false,
+        });
+        let mut messages = Vec::new();
+        widget.update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+            &(), &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages),
+            &Rectangle::with_size(Size::new(400.0, 60.0)));
+        assert!(!messages.iter().any(|message| matches!(message, AppMessage::UndoDraft)));
+        tree.children[0].state.downcast_mut::<iced::widget::text_input::State<()>>().focus();
+        messages.clear();
+        widget.update(&mut tree, &event, Layout::new(&node), mouse::Cursor::Unavailable,
+            &(), &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages),
+            &Rectangle::with_size(Size::new(400.0, 60.0)));
+        assert!(messages.iter().any(|message| matches!(message, AppMessage::UndoDraft)));
     }
 
     #[test]

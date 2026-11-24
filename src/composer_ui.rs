@@ -69,6 +69,8 @@ pub fn close_link(state: &mut TeamsApp) -> Task<AppMessage> {
 pub fn toolbar(state: &TeamsApp) -> Element<'_, AppMessage> {
     let formatting = state.active_formatting();
     let selection = state.selected_draft_range();
+    let line_selection = selection.unwrap_or_else(||
+        message_body::editor_cursor_range(&state.draft, state.composer_content.cursor()));
     let key = state.draft_key();
     let active_marks = key.as_ref().and_then(|key| state.draft_active_marks.get(key));
     let mut tools = row![].spacing(4).align_y(Alignment::Center);
@@ -87,13 +89,13 @@ pub fn toolbar(state: &TeamsApp) -> Element<'_, AppMessage> {
         (Icon::TextBullets, message_body::ListKind::Unordered, tr("Bulleted list")),
         (Icon::TextNumbered, message_body::ListKind::Ordered, tr("Numbered list")),
     ] {
-        tools = tools.push(control(icon, label, selection.map(|_| AppMessage::ToggleDraftList(kind)), false));
+        tools = tools.push(control(icon, label, Some(AppMessage::ToggleDraftList(kind)), formatting.has_list(&state.draft, line_selection, kind)));
     }
     tools = tools.push(control(
         Icon::QuoteReply,
         tr("Block quote"),
-        selection.map(|_| AppMessage::ToggleDraftQuote),
-        selection.is_some_and(|selection| formatting.has_quote(&state.draft, selection)),
+        Some(AppMessage::ToggleDraftQuote),
+        formatting.has_quote(&state.draft, line_selection),
     ));
     let table_menu = (state.composer_menu == Some(Menu::Table)).then(|| table_picker());
     tools = tools.push(crate::composer_popover::view(
@@ -118,7 +120,7 @@ pub fn toolbar(state: &TeamsApp) -> Element<'_, AppMessage> {
     let link_menu = state.link_editor_open.then(|| link_dialog(state));
     tools = tools.push(crate::composer_popover::view(
         control(Icon::Link, tr("Insert link"), Some(AppMessage::OpenDraftLink), state.link_editor_open), link_menu));
-    tools = tools.push(control(Icon::CodeBlock, tr("Code block"), selection.map(|_| AppMessage::ToggleDraftCodeBlock), false));
+    tools = tools.push(control(Icon::CodeBlock, tr("Code block"), Some(AppMessage::ToggleDraftCodeBlock), formatting.has_code_block(&state.draft, line_selection)));
     let more_menu = (state.composer_menu == Some(Menu::More)).then(|| more_options(state));
     tools = tools.push(crate::composer_popover::view(
         control(Icon::More, tr("More formatting options"), Some(AppMessage::ToggleComposerMenu(Menu::More)), more_menu.is_some()), more_menu));
@@ -186,7 +188,7 @@ fn font_sizes(selected: u16) -> Element<'static, AppMessage> {
 fn more_options(state: &TeamsApp) -> Element<'_, AppMessage> {
     popup(column![
         crate::message_menu_action(Icon::CodeBlock, tr("Inline code"), Some(AppMessage::ApplyDraftMark(message_body::InlineMark::Code)), Tone::Text),
-        crate::message_menu_action(Icon::QuoteReply, tr("Block quote"), state.selected_draft_range().map(|_| AppMessage::ToggleDraftQuote), Tone::Text),
+        crate::message_menu_action(Icon::QuoteReply, tr("Block quote"), Some(AppMessage::ToggleDraftQuote), Tone::Text),
         crate::message_menu_action(Icon::Table, tr("Insert table"), Some(AppMessage::ToggleComposerMenu(Menu::Table)), Tone::Text),
         crate::message_menu_action(Icon::Delete, tr("Clear formatting"), state.selected_draft_range().map(|_| AppMessage::ClearDraftFormatting), Tone::Text),
         crate::message_menu_action(Icon::Preview, tr("Preview message"), (!state.draft.is_empty()).then_some(AppMessage::ToggleDraftPreview), Tone::Text),
